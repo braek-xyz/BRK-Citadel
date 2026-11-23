@@ -7,7 +7,6 @@
  *   TIME [PITCH], REPEATS [SAMPLE], POSITION [LENGTH], BRAEK [PITCH MOD], WONK [SAMPLE MOD]
  *   SHIFT + [SAMPLE MOD] = DAMAGE, SHIFT + [LENGTH] = MIX, SHIFT + [SAMPLE] = SYNC (left) / FREE (right)
  *   MODE button held = HOLD; SHIFT + tap MODE = FREEZE on / off
- *   TRIG input (gate) = HOLD; RESET input (gate) = FREEZE while high
  *   LFO, tempo, input / output level, clock and sync work as in Bastl's firmwares.
  */
 
@@ -153,8 +152,10 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
         mode_used_with_shift_ = false;
     }
     mode_was_pressed_ = mode;
-    params_.hold = (mode && !mode_used_with_shift_) || Kastle2::hw.GetTriggerIn();
-    params_.freeze = freeze_toggle_ || Kastle2::hw.GetResetIn();
+    // TRIG and RESET are not used: on the Citadel they are normalled to internal gates when nothing is patched,
+    // which switched HOLD on by itself (first hardware test, 2026-11-23).
+    params_.hold = mode && !mode_used_with_shift_;
+    params_.freeze = freeze_toggle_;
 
     // ---- clock: start cycles on the beat when synced ----
     Clock &clock = Kastle2::base.GetClock();

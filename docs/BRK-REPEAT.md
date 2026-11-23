@@ -4,7 +4,7 @@ A beat repeater / micro sound repeater. It keeps a short memory of the incoming 
 over and over, in time with your clock. Add random gaps and jumps (BRAEK), random speed and direction (WONK) and
 crunch (DAMAGE), or freeze a loop. Same idea as the REPEAT effect in LAZERS.
 
-**Version 0.1, first test build.** Not yet tried on hardware.
+**Version 0.2, test build.** 0.1 was tried once on hardware (no sound; HOLD switched on by itself).
 
 ## Install
 1. Download `brk-citadel-firmware` from the latest green run of "Build firmware" on GitHub (Actions tab), unzip it.
@@ -39,8 +39,7 @@ separately and are not touched, but Wave Bard settings may reset when you switch
 | LENGTH CV | adds to POSITION |
 | SAMPLE CV | adds to BRAEK |
 | BANK CV | adds to WONK |
-| TRIG in | HOLD while the gate is high |
-| RESET in | FREEZE while the gate is high |
+| TRIG in, RESET in | not used yet (they carry internal gates when unpatched) |
 | GATE out | a short pulse at every repeat |
 | Clock / sync in | tempo; cycles start on the beat when synced |
 
