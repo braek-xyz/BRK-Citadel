@@ -3,14 +3,18 @@
 **Last session: 2026-11-23**
 
 Done:
-- Researched the platform (plan: `docs/PLAN.md`). Forked Bastl's `kastle2` as `braek-xyz/BRK-Citadel`.
-- Cloud build added (`.github/workflows/build.yml`): builds Bastl's stock **FX Wizard** and **Template** `.uf2`,
-  unchanged, to prove the build chain. Built in a cloud session first: exit 0, FX Wizard flash 82 %, RAM 8.5 % static.
+- Platform research (`docs/PLAN.md`), fork `braek-xyz/BRK-Citadel`, cloud build (PR #1, merged; run green).
+- **BRK Repeat 0.1** (Phase 1 + most of Phase 2): `code/src/apps/BrkRepeat/`. Fixed-point ring-buffer repeater:
+  TIME (synced / free), REPEATS 1-16, POSITION, BRAEK, WONK, DAMAGE, MIX, FREEZE (cycle-synced), HOLD (instant),
+  CV on the main controls, gate out per repeat, LEDs. Controls named for the Wave Bard panel (`docs/BRK-REPEAT.md`).
+- Engine host tests: `code/tests/brk_repeat_test.cpp`, 12 checks, 0 failed (passthrough bit-exact, slicing,
+  previous-cycle read, freeze loop, hold loop, fuzz under ASan/UBSan, click test: largest step 251 on a 110 Hz sine).
+- Firmware builds: flash 279 KB (53 %), static RAM 219 KB (89 %; FX Wizard needs about 232 KB incl. its heap delays).
+
+Not tested: nothing on a Citadel yet. CPU load, knob feel, clock sync, CV ranges, LEDs and gate out are untested.
 
 Next:
-1. BRAEK downloads `kastle2-fx-wizard.uf2` from the Actions run, flashes it, and checks it behaves like stock FX Wizard.
-   (To go back to Wave Bard: Bastl's official Wave Bard file, which includes the samples.)
-2. Phase 1: `dsp-research` on the repeater design for RP2040 (fixed point, memory), then agree the controls map,
-   then the first playable BRK Repeat app.
-
-Not tested: nothing has run on a Citadel yet.
+1. BRAEK flashes `kastle2-brk-repeat.uf2` and reports: does it pass audio, do REPEATS / TIME / HOLD / FREEZE work,
+   any clicks, LED colours, clock sync.
+2. Fix what BRAEK finds. Then Phase 3 "added features" (BRAEK chooses; `dsp-research` for anything new).
+3. Later: ask Bastl to add app ID 0x42 "BRK Repeat" to APP_LIST.md (community list).
