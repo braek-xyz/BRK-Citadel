@@ -31,7 +31,7 @@ jobs:
 
       - name: Test the repeater engine (on the build computer)
         run: |
-          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I code/src code/tests/brk_repeat_test.cpp -o brk_repeat_test
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I code/src -I code/tests/er301_reference code/tests/brk_repeat_test.cpp code/tests/er301_reference/RefWrap.cpp -o brk_repeat_test
           ./brk_repeat_test
 
       - name: Build

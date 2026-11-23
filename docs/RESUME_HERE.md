@@ -21,8 +21,25 @@ After raising it, levels OK. Manual should tell users to check SHIFT + PITCH MOD
 Hardware test 3 (0.2): knobs did nothing; HOLD worked at a fixed length. Cause: FancyPot values update only in
 ReadValue(), which must be called from UiLoop() (as FX Wizard does). Fixed in 0.3.
 
+Hardware test 4 (0.3): BRAEK: "sounds really bad", no control over the synced time; wants it to behave like the ER-301
+brk repeat (and the feel of a Data Bender, without copying it). BRAEK's clock: 1/4 notes (1 pulse per beat), ~110 bpm.
+Decisions: stereo, full quality (longest cycle ~0.56 s; synced lengths halve to fit); keep WONK; BRAEKBEATZ effects
+may be added later (BRAEK's own code; which ones still to ask; dsp-research for new DSP).
+
+**BRK Repeat 0.4** (this session): the engine is now a port of the ER-301 engine (BRK-ER301 `dsp/RepeatEngine.cpp`
+= LAZERS REPEAT): block logic in double, line for line; per-sample read / record / crossfades / DAMAGE / mix in fixed
+point. Engine runs one 48-sample block per audio loop. TIME: the ten LAZERS notes (synced) or 12.5 ms..0.56 s (free).
+SHIFT + SAMPLE = CLOCK: FREE | 1 | 2 | 4 | 24 pulses per beat (default 1). HOLD / FREEZE as on the ER-301.
+- Host test: `code/tests/brk_repeat_test.cpp` runs it next to the ER-301 engine (copied in `code/tests/er301_reference`):
+  20 checks, 0 failed; outputs within about -56 to -86 dB of the ER-301 engine (DAMAGE at settings with fractional
+  hold counts differs by single-sample hold timing, -25 dB, compared loosely).
+- Build: flash 291 KB, static RAM 228 KB (93 %; 0.3 ran with 219 KB). `rdMap` runs from RAM (`.time_critical`),
+  the block function from flash (compiled -Os; -O3 made it 18 KB).
+- Not tested: CPU load on the chip (no emulator here; estimate well under the 1.09 ms per block), heap headroom,
+  clock sync on hardware, sound.
+
 Next:
-1. BRAEK flashes `kastle2-brk-repeat.uf2` and reports: does it pass audio, do REPEATS / TIME / HOLD / FREEZE work,
-   any clicks, LED colours, clock sync.
-2. Fix what BRAEK finds. Then Phase 3 "added features" (BRAEK chooses; `dsp-research` for anything new).
+1. BRAEK flashes 0.4 and reports: sound vs the ER-301, TIME note steps at 110 bpm, CLOCK setting, HOLD / FREEZE,
+   any crackle (= CPU) or failure to start (= memory).
+2. Ask BRAEK which BRAEKBEATZ effects to bring in, and what about the Data Bender feel matters most.
 3. Later: ask Bastl to add app ID 0x42 "BRK Repeat" to APP_LIST.md (community list).

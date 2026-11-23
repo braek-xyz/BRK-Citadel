@@ -1,13 +1,15 @@
 /*
  * BRK Repeat: beat repeater / micro sound repeater app for the Bastl Citadel (and Kastle 2).
  * Copyright (c) 2026 BRAEK. MIT License (see LICENSE in the repository root).
- * Built on Bastl Instruments' Kastle 2 framework (MIT).
+ * Built on Bastl Instruments' Kastle 2 framework (MIT).  The sound is BRAEK's LAZERS REPEAT, as in the ER-301
+ * "brk repeat" unit (RepeatEngine.hpp).
  *
  * Controls (Wave Bard panel names in brackets):
  *   TIME [PITCH], REPEATS [SAMPLE], POSITION [LENGTH], BRAEK [PITCH MOD], WONK [SAMPLE MOD]
- *   SHIFT + [SAMPLE MOD] = DAMAGE, SHIFT + [LENGTH] = MIX, SHIFT + [SAMPLE] = SYNC (left) / FREE (right)
+ *   SHIFT + [SAMPLE MOD] = DAMAGE, SHIFT + [LENGTH] = MIX,
+ *   SHIFT + [SAMPLE] = CLOCK: FREE time, or synced with 1, 2, 4 or 24 clock pulses per beat
  *   MODE button held = HOLD; SHIFT + tap MODE = FREEZE on / off
- *   LFO, tempo, input / output level, clock and sync work as in Bastl's firmwares.
+ *   LFO, tempo, input / output level and the clock input work as in Bastl's firmwares.
  */
 
 #include "AppBrkRepeat.hpp"
@@ -18,8 +20,8 @@
 using namespace kastle2;
 
 // Audio memory for the repeater: static, so nothing is allocated while audio runs.
-static int16_t g_buf_left[brk::RepeatEngine::kBufLen];
-static int16_t g_buf_right[brk::RepeatEngine::kBufLen];
+static int16_t g_buf_left[brk::RepeatEngine::kBufferLen];
+static int16_t g_buf_right[brk::RepeatEngine::kBufferLen];
 
 void AppBrkRepeat::Init()
 {
@@ -51,19 +53,27 @@ void AppBrkRepeat::Init()
     pots_[Pot::MIX] = FancyPot::Create({.pot = Hardware::Pot::POT_4,
                                         .layer = Hardware::Layer::SHIFT,
                                         .initial_value = POT_MAX});
-    pots_[Pot::SYNC] = FancyPot::Create({.pot = Hardware::Pot::POT_6,
-                                         .layer = Hardware::Layer::SHIFT,
-                                         .initial_value = POT_MIN});
+    // default: synced, one clock pulse per beat (a 1/4-note clock)
+    pots_[Pot::CLOCK] = FancyPot::Create({.pot = Hardware::Pot::POT_6,
+                                          .layer = Hardware::Layer::SHIFT,
+                                          .initial_value = (POT_MAX * 3) / (2 * kClockZones)});
     for (auto &pot : pots_)
     {
         pot->Init(AUDIO_LOOP_RATE);
     }
 
-    engine_.Init(g_buf_left, g_buf_right);
+    engine_.Init(g_buf_left, g_buf_right, static_cast<double>(SAMPLE_RATE));
+    // free TIME: the whole knob sweeps 12.5 ms .. the longest cycle (engine TIME is 12.5 ms x 320^time)
+    free_time_max_ = std::log(engine_.MaxCycleSeconds() / 0.0125) / std::log(320.0);
     freeze_toggle_ = false;
     mode_was_pressed_ = false;
     mode_used_with_shift_ = false;
-    beat_count_ = 0;
+    hold_engaged_ = false;
+    pulse_count_ = 0;
+    have_beat_ = false;
+    beats_ = 0;
+    samples_since_beat_ = 0;
+    beat_period_ = 0;
 
     inited_ = true;
 }
@@ -84,35 +94,43 @@ int32_t AppBrkRepeat::PotWithCv(Pot pot, Hardware::AnalogInput cv, bool pitch_in
     return constrain(v + c, POT_MIN, POT_MAX);
 }
 
-int32_t AppBrkRepeat::ComputeCycleLength(int32_t time, bool synced, int32_t &beats_q8)
+// One audio loop of the clock: pulses -> beats (every pulses_per_beat_ pulses), the beat length in samples and the
+// song position.  Same idea as the ER-301 unit: the position moves on smoothly between beats, but never past the next
+// beat, so if the clock stops the position stops too (and after 0.25 s SYNC runs on at the last tempo).
+void AppBrkRepeat::ClockTick()
 {
-    using E = brk::RepeatEngine;
-    if (synced)
+    Clock &clock = Kastle2::base.GetClock();
+    if (clock.IsNowReset())
     {
-        int32_t idx = (time * kSyncSteps) / (POT_MAX + 1);
-        idx = constrain(idx, 0, kSyncSteps - 1);
-        beats_q8 = kSyncBeatsQ8[idx];
-        const int32_t beat_samples =
-            static_cast<int32_t>(Kastle2::base.GetClock().GetTargetTicks()) * static_cast<int32_t>(AUDIO_BUFFER_SIZE);
-        int32_t len = static_cast<int32_t>((static_cast<int64_t>(beat_samples) * beats_q8) >> 8);
-        // too long for the memory: halve it (stays in time with the beat)
-        while (len > E::kMaxCycle && beats_q8 > 8)
-        {
-            beats_q8 /= 2;
-            len /= 2;
-        }
-        return len;
+        pulse_count_ = 0;
+        have_beat_ = false;
+        beats_ = 0;
+        samples_since_beat_ = 0;
     }
-    // free time: 12.5 ms .. about 1.2 s, exponential
-    beats_q8 = 0;
-    const float x = static_cast<float>(time) / static_cast<float>(POT_MAX);
-    const float ratio = static_cast<float>(E::kMaxCycle) / static_cast<float>(E::kMinCycle);
-    return static_cast<int32_t>(static_cast<float>(E::kMinCycle) * powf(ratio, x));
+    if (clock.IsNowTrigger())
+    {
+        if (pulse_count_ % static_cast<uint32_t>(pulses_per_beat_) == 0)
+        {
+            if (have_beat_)
+            {
+                const double lo = SAMPLE_RATE * 60.0 / 400.0, hi = SAMPLE_RATE * 60.0 / 20.0;
+                if (samples_since_beat_ >= lo && samples_since_beat_ <= hi)
+                {
+                    beat_period_ = samples_since_beat_;
+                }
+                beats_ += 1;
+            }
+            have_beat_ = true;
+            samples_since_beat_ = 0;
+            beat_blink_ = 12;
+        }
+        pulse_count_++;
+    }
 }
 
 FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
 {
-    if (!inited_)
+    if (!inited_ || size != KS)
     {
         return;
     }
@@ -122,20 +140,50 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
         pot->Process();
     }
 
-    // ---- parameters ----
-    synced_ = pots_[Pot::SYNC]->GetValue() < POT_HALF;
-    const int32_t time = PotWithCv(Pot::TIME, CV_TIME, true);
-    // knob right = shorter cycle feels natural for "faster" in free mode; keep knob right = longer for both
-    params_.cycle_len = ComputeCycleLength(time, synced_, cycle_beats_q8_);
-    const int32_t rep = PotWithCv(Pot::REPEATS, CV_REPEATS, true);
-    params_.repeats = 1 + (rep * 16) / (POT_MAX + 1);
-    params_.position = PotWithCv(Pot::POSITION, CV_POSITION, false);
-    params_.braek = PotWithCv(Pot::BRAEK, CV_BRAEK, false);
-    params_.wonk = PotWithCv(Pot::WONK, CV_WONK, false);
-    params_.damage = Kastle2::base.GetLfoMod().AdjustedPotValue(pots_[Pot::DAMAGE].get());
-    params_.mix = (Kastle2::base.GetLfoMod().AdjustedPotValue(pots_[Pot::MIX].get()) * 32767) / POT_MAX;
+    // ---- clock ----
+    const int32_t zone = constrain((pots_[Pot::CLOCK]->GetValue() * kClockZones) / (POT_MAX + 1), 0, kClockZones - 1);
+    synced_ = zone > 0;
+    if (synced_ && kPulsesPerBeat[zone] != pulses_per_beat_)
+    {
+        pulses_per_beat_ = kPulsesPerBeat[zone];
+        pulse_count_ = 0;
+        have_beat_ = false;
+    }
+    ClockTick();
+    double bpm = 0, song_pos = 0;
+    if (beat_period_ > 0)
+    {
+        bpm = 60.0 * SAMPLE_RATE / beat_period_;
+        double frac = samples_since_beat_ / beat_period_;
+        if (frac > 1)
+        {
+            frac = 1;
+        }
+        song_pos = (beats_ + frac) * beat_period_ / SAMPLE_RATE;
+    }
+    engine_.SetTransport(bpm, song_pos);
 
-    // HOLD: MODE button (not when used with SHIFT) or TRIG gate
+    // ---- controls ----
+    const int32_t time = PotWithCv(Pot::TIME, CV_TIME, true);
+    if (synced_)
+    {
+        // ten note lengths: 1/16, 1/8, 1/8., 1/4, 1/4., 1/2, 1/2., 1 bar, 1.5 bars, 2 bars (halved if too long)
+        const int32_t note = constrain((time * 10) / (POT_MAX + 1), 0, 9);
+        engine_.SetParam(Engine::TIME, (note + 0.5) / 10.0);
+    }
+    else
+    {
+        engine_.SetParam(Engine::TIME, Unit(time) * free_time_max_);
+    }
+    engine_.SetParam(Engine::SYNC, synced_ ? 1 : 0);
+    engine_.SetParam(Engine::REPEATS, 1.0 + 15.0 * Unit(PotWithCv(Pot::REPEATS, CV_REPEATS, true)));
+    engine_.SetParam(Engine::POSITION, Unit(PotWithCv(Pot::POSITION, CV_POSITION, false)));
+    engine_.SetParam(Engine::BRAEK, Unit(PotWithCv(Pot::BRAEK, CV_BRAEK, false)));
+    engine_.SetParam(Engine::WONK, Unit(PotWithCv(Pot::WONK, CV_WONK, false)));
+    engine_.SetParam(Engine::DAMAGE, Unit(Kastle2::base.GetLfoMod().AdjustedPotValue(pots_[Pot::DAMAGE].get())));
+    engine_.SetParam(Engine::MIX, Unit(Kastle2::base.GetLfoMod().AdjustedPotValue(pots_[Pot::MIX].get())));
+
+    // ---- buttons: MODE held = HOLD, SHIFT + tap MODE = FREEZE toggle ----
     const bool shift = Kastle2::hw.Pressed(Hardware::Button::SHIFT);
     const bool mode = Kastle2::hw.Pressed(Hardware::Button::MODE);
     if (mode && shift)
@@ -144,7 +192,6 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
     }
     if (!mode && mode_was_pressed_)
     {
-        // MODE released: a SHIFT + MODE tap toggles FREEZE
         if (mode_used_with_shift_)
         {
             freeze_toggle_ = !freeze_toggle_;
@@ -154,40 +201,37 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
     mode_was_pressed_ = mode;
     // TRIG and RESET are not used: on the Citadel they are normalled to internal gates when nothing is patched,
     // which switched HOLD on by itself (first hardware test, 2026-11-23).
-    params_.hold = mode && !mode_used_with_shift_;
-    params_.freeze = freeze_toggle_;
-
-    // ---- clock: start cycles on the beat when synced ----
-    Clock &clock = Kastle2::base.GetClock();
-    if (clock.IsNowReset())
+    // HOLD as on the ER-301: freezes at once while held, releases at once; the engine stays in HOLD mode until the
+    // hold-freeze has ended.
+    const bool hold_pressed = mode && !mode_used_with_shift_;
+    if (hold_pressed)
     {
-        beat_count_ = 0;
-        if (synced_)
-        {
-            engine_.Realign();
-        }
+        hold_engaged_ = true;
     }
-    else if (clock.IsNowTrigger())
+    else if (!engine_.Frozen())
     {
-        beat_count_++;
-        if (synced_)
-        {
-            const int32_t beats_per_cycle = cycle_beats_q8_ >> 8; // 0 when the cycle is shorter than a beat
-            if (beats_per_cycle <= 1 || (beat_count_ % beats_per_cycle) == 0)
-            {
-                engine_.Realign();
-            }
-        }
+        hold_engaged_ = false;
     }
+    engine_.SetParam(Engine::HOLD, (hold_pressed || hold_engaged_) ? 1 : 0);
+    engine_.SetParam(Engine::FREEZE, freeze_toggle_ ? 1 : 0);
+    engine_.SetParam(Engine::FREEZEHOLD, hold_pressed ? 1 : 0);
 
     // ---- audio ----
-    engine_.SetParams(params_);
-    engine_.Process(input, output, size);
+    for (int i = 0; i < KS; i++)
+    {
+        in_l_[i] = input[2 * i];
+        in_r_[i] = input[2 * i + 1];
+    }
+    engine_.ProcessBlock(in_l_, in_r_, out_l_, out_r_);
+    for (int i = 0; i < KS; i++)
+    {
+        output[2 * i] = out_l_[i];
+        output[2 * i + 1] = out_r_[i];
+    }
+    samples_since_beat_ += KS;
 
-    // ---- outputs and LED info ----
-    const bool slice = engine_.TakeSliceFlag();
-    const bool cycle = engine_.TakeCycleFlag();
-    if (cycle)
+    // ---- gate out and LED info ----
+    if (engine_.TakeCycleFlag())
     {
         cycle_blink_ = 20; // audio loops (about 22 ms)
     }
@@ -195,7 +239,7 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
     {
         cycle_blink_ = cycle_blink_ - 1;
     }
-    if (slice)
+    if (engine_.TakeSliceFlag())
     {
         slice_blink_ = 10;
     }
@@ -203,9 +247,13 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
     {
         slice_blink_ = slice_blink_ - 1;
     }
-    // GATE out: a short pulse at every repeat (slice start)
+    if (beat_blink_ > 0)
+    {
+        beat_blink_ = beat_blink_ - 1;
+    }
+    // GATE out: a short pulse at every slice
     Kastle2::hw.SetGateOut(slice_blink_ > 5);
-    state_ = static_cast<uint8_t>(engine_.GetState());
+    state_ = hold_pressed ? 3 : (engine_.Frozen() ? 2 : (engine_.Passing() ? 0 : 1));
 }
 
 void AppBrkRepeat::UiLoop()
@@ -219,18 +267,17 @@ void AppBrkRepeat::UiLoop()
     if (Kastle2::hw.GetLayer() == Hardware::Layer::NORMAL || Kastle2::hw.GetLayer() == Hardware::Layer::MODE)
     {
         uint32_t color;
-        switch (static_cast<brk::RepeatEngine::State>(state_))
+        switch (state_)
         {
-        case brk::RepeatEngine::State::LIVE:
+        case 0:
             color = WS2812::DARK_GREEN;
             break;
-        case brk::RepeatEngine::State::REPEATING:
+        case 1:
             color = WS2812::ORANGE;
             break;
-        case brk::RepeatEngine::State::FROZEN:
+        case 2:
             color = WS2812::BLUE;
             break;
-        case brk::RepeatEngine::State::HOLD:
         default:
             color = WS2812::RED;
             break;
@@ -240,8 +287,24 @@ void AppBrkRepeat::UiLoop()
             color = WS2812::ApplyBrightness(color, 96);
         }
         Kastle2::hw.SetLed(Hardware::Led::LED_1, color);
-        // LED 2: white flash at each cycle start; purple while FREE time
-        uint32_t c2 = cycle_blink_ > 0 ? WS2812::WHITE : (synced_ ? WS2812::NONE : WS2812::ApplyBrightness(WS2812::PURPLE, 64));
+        // LED 2: white flash at each cycle start, dim green on each beat of the clock; purple while FREE time
+        uint32_t c2;
+        if (cycle_blink_ > 0)
+        {
+            c2 = WS2812::WHITE;
+        }
+        else if (!synced_)
+        {
+            c2 = WS2812::ApplyBrightness(WS2812::PURPLE, 64);
+        }
+        else if (beat_blink_ > 0)
+        {
+            c2 = WS2812::ApplyBrightness(WS2812::GREEN, 64);
+        }
+        else
+        {
+            c2 = WS2812::NONE;
+        }
         Kastle2::hw.SetLed(Hardware::Led::LED_2, c2);
     }
 }

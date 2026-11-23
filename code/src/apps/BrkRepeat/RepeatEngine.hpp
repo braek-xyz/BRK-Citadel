@@ -1,512 +1,808 @@
 /*
- * BRK Repeat engine: beat repeater / micro sound repeater for the RP2040 (Bastl Citadel / Kastle 2).
+ * BRK Repeat engine for the RP2040 (Bastl Citadel / Kastle 2).
  * Copyright (c) 2026 BRAEK. MIT License (see LICENSE in the repository root).
  *
- * Plain C++ (no Kastle 2 / Pico SDK dependency), integer and fixed-point maths only (the RP2040 has no FPU).
- * Design follows BRAEK's LAZERS REPEAT + FREEZE (cycle, repeats, position, braek, wonk, damage, freeze, hold),
- * rewritten for a small memory and integer maths.
+ * This is BRAEK's LAZERS 2.0.0 REPEAT + FREEZE effect, as ported to the ER-301 in BRK-ER301 (dsp/RepeatEngine.cpp,
+ * "brk repeat"), ported once more for a CPU with no floating-point unit and 264 kB of RAM.  Plain C++, no Kastle 2 or
+ * Pico SDK code, so the same file runs in the host tests next to the ER-301 engine.
  *
- * How it works
- * - Audio is recorded into a ring buffer all the time (except while frozen / held).
- * - Time is cut into CYCLES of length L samples; each cycle is cut into R SLICES of length S = L / R.
- * - In every slice we play the audio that belongs to slice number M of the current cycle (POSITION). Slice k of a
- *   cycle with M == k is just the live sound, so R = 1 (or M == k) passes the input through unchanged.
- * - BRAEK: per slice, a chance to jump to a random slice or to be silent. WONK: per slice, a chance to play at another
- *   speed and/or backwards. Random choices are made one slice ahead so fades can be planned.
- * - FREEZE: at the next cycle start, stop recording and keep looping the cycle that just finished. Releases at a
- *   cycle start too. HOLD: instantly loop the last slice heard (S samples), until released.
- * - DAMAGE: sample-rate and bit reduction of the repeats.
- * - Fades of about 3 ms are applied at every slice edge that is not continuous, so there are no clicks.
+ * How the port is split
+ * - Once per block (KS samples): the LAZERS control logic, line for line, in double (cycle clock, slicing, SYNC phase,
+ *   BRAEK / WONK random choices, FREEZE / HOLD, crossfade state).  It runs about 900 times a second on the Citadel.
+ * - Every sample: integer and fixed-point only.  Positions are whole samples; slice lengths are Q16 (1/65536 sample);
+ *   gains are Q15 with 32768 = 1.0; the history is 16-bit stereo.
  *
- * Real-time rules: no allocation, no locks, no floating point in Process().
+ * Differences from the ER-301 engine (everything else is the same):
+ *   1. History: 50000 samples per channel, 16-bit (ER-301: 10 s, float).  The longest cycle is therefore
+ *      (50000 - 2 x 4 ms - 2 x KS - 64) / 2 samples, about 0.56 s at 44 kHz (ER-301: 4 s).
+ *   2. SYNC: a note length longer than the longest cycle is halved until it fits (ER-301: SYNC turns off and the cycle
+ *      is clamped).  So SYNC always stays on the beat.
+ *   3. Per-sample maths in fixed point (results within a few 16-bit steps of the double engine; see the host test).
+ *      The two 1e6-steep LAZERS switches (read from the previous cycle; second half of a cycle) are plain compares.
+ *   4. DAMAGE bit reduction rounds halves away from zero (LAZERS: to even).
+ *   5. The LAZERS idle self-heal is not part of it (as on the ER-301).
+ *
+ * Real-time rules: ProcessBlock() never allocates, locks or touches flash or files.
  */
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+
+#ifndef BRK_FAST
+#define BRK_FAST
+#endif
+// The per-block function is large (the LAZERS control logic); it is compiled for size and stays in flash, while the
+// per-sample read (rdMap) can be put in RAM with BRK_FAST.
+#if defined(__GNUC__) && !defined(__clang__)
+#define BRK_COMPACT __attribute__((optimize("Os")))
+#define BRK_HOT __attribute__((optimize("O2")))
+#define BRK_INLINE __attribute__((always_inline)) inline
+#else
+#define BRK_COMPACT
+#define BRK_HOT
+#define BRK_INLINE inline
+#endif
 
 namespace brk
 {
 
-class RepeatEngine
+// ---- helpers, as in BRK-ER301 dsp/DspCommon.h -------------------------------------------------------------------
+inline double clampLo(double x, double lo, double hi)
+{
+    if (lo >= hi)
+        return 0.5 * (lo + hi);
+    if (x >= lo && x <= hi)
+        return x;
+    return x > hi ? hi : lo;
+}
+inline double ffloor(double x)
+{
+    if (x > -2147483648.0 && x < 2147483647.0)
+    {
+        double d = (double)(int32_t)x;
+        return d > x ? d - 1.0 : d;
+    }
+    return std::floor(x);
+}
+inline double roundEven(double x)
+{
+    if (!(std::fabs(x) < 2147483647.0))
+        return 0.0;
+    double f = ffloor(x), d = x - f;
+    if (d > 0.5)
+        return f + 1.0;
+    if (d < 0.5)
+        return f;
+    return (((int32_t)f) & 1) ? f + 1.0 : f;
+}
+inline double truncTo0(double x) { return x < 0 ? -ffloor(-x) : ffloor(x); }
+
+struct Random // 64-bit LCG, Knuth MMIX constants, top 53 bits (as LAZERS)
+{
+    uint64_t s = 1;
+    void seed(uint64_t v) { s = v * 2 + 1; next(); }
+    uint64_t next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s; }
+    double uniform() { return (double)(next() >> 11) * (1.0 / 9007199254740992.0); }
+    double range(double lo, double hi) { return lo + uniform() * (hi - lo); }
+};
+
+struct ChangeDetect
+{
+    double last = 0;
+    bool operator()(double v)
+    {
+        if (v != last)
+        {
+            last = v;
+            return true;
+        }
+        return false;
+    }
+};
+
+// SYNC note lengths in beats (LAZERS giSyncT): 1/16, 1/8, 1/8., 1/4, 1/4., 1/2, 1/2., 1 bar, 1.5 bars, 2 bars
+static constexpr double kSyncT[10] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0};
+
+// ---- the engine ----------------------------------------------------------------------------------------------------
+template <int KS>
+class RepeatCore
 {
 public:
-    static constexpr int32_t kBufLen = 50000;   ///< Samples per channel (about 1.1 s at 44 kHz). Must fit RAM with Bastl's framework (FX Wizard uses 2 x 50800).
-    static constexpr int32_t kFade = 132;       ///< Fade length at slice edges, samples (3 ms).
-    static constexpr int32_t kMinCycle = 550;   ///< Shortest cycle, samples (12.5 ms).
-    static constexpr int32_t kMaxCycle = kBufLen - 2 * kFade; ///< Longest cycle, samples.
-    static constexpr int32_t kMaxRepeats = 16;
-    static constexpr int32_t kOne = 256;        ///< Speed 1.0 in Q8.
-
-    enum class State
+    enum Param
     {
-        LIVE,      ///< Passing the input (nothing repeating right now)
-        REPEATING, ///< Repeating slices
-        FROZEN,    ///< FREEZE active
-        HOLD       ///< HOLD active
+        MIX,        // 0..1    incoming vs repeats
+        TIME,       // 0..1    free: 12.5 ms x 320^time; sync: note length by tenths (see kSyncT)
+        REPEATS,    // 1..16   slices per cycle
+        POSITION,   // 0..1    which slice repeats
+        BRAEK,      // 0..1    random gaps and jumps
+        WONK,       // 0..1    random speed / direction per repeat
+        DAMAGE,     // 0..1    sample-rate and bit reduction
+        SYNC,       // 0 / 1   TIME follows tempo
+        FREEZE,     // 0 / 1   loop the current cycle (starts / stops at a cycle end)
+        FREEZEHOLD, // 0 / 1   momentary FREEZE (HOLD mode)
+        HOLD,       // 0 / 1   HOLD mode: FREEZE starts / stops at once
+        COUNT
     };
 
-    struct Params
-    {
-        int32_t cycle_len = 22000; ///< Cycle length in samples (clamped to kMinCycle..kMaxCycle)
-        int32_t repeats = 1;       ///< 1..16
-        int32_t position = 0;      ///< 0..4095: which slice repeats
-        int32_t braek = 0;         ///< 0..4095: random gaps and jumps
-        int32_t wonk = 0;          ///< 0..4095: random speed / direction
-        int32_t damage = 0;        ///< 0..4095: rate and bit reduction of the repeats
-        int32_t mix = 32767;       ///< 0..32767: dry / wet
-        bool freeze = false;       ///< FREEZE request (applied at the next cycle start)
-        bool hold = false;         ///< HOLD (applied at once)
-    };
+    static constexpr int32_t kHist = 50000;         ///< history samples per channel
+    static constexpr size_t kBufferLen = kHist + 1; ///< int16 per channel the caller gives (one guard point)
 
-    /// @param left, right buffers of kBufLen samples each, owned by the caller (static memory).
-    void Init(int16_t *left, int16_t *right)
+    void Init(int16_t *left, int16_t *right, double sample_rate)
     {
-        buf_[0] = left;
-        buf_[1] = right;
-        for (int32_t i = 0; i < kBufLen; i++)
-        {
-            left[i] = 0;
-            right[i] = 0;
-        }
-        w_ = 0;
-        t_ = 0;
-        L_ = 22000;
-        R_ = 1;
-        S_ = L_;
-        cs_ = 0;
-        k_ = 0;
-        cur_ = Slice{};
-        next_ = Slice{};
-        edge_in_cont_ = true;
-        cont_ = true;
-        next_k_ = 0;
-        frozen_ = false;
-        writing_ = true;
-        hold_ = false;
-        hold_start_ = 0;
-        hold_len_ = kMinCycle;
-        hold_pos_ = 0;
-        hold_x_ = 0;
-        mix_ = 32768;
-        dmg_acc_ = 0;
-        dmg_hold_[0] = dmg_hold_[1] = 0;
-        rng_ = 0x9E3779B9u;
-        force_boundary_ = false;
-        cycle_flag_ = false;
-        slice_flag_ = false;
+        BL = left;
+        BR = right;
+        sr_ = sample_rate;
+        static const double def[COUNT] = {0, 0.5, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+        for (int i = 0; i < COUNT; i++)
+            prm_[i] = def[i];
+        for (int i = 0; i <= kTab; i++)
+            sinTab_[i] = (uint16_t)std::lround(std::sin((double)i / kTab * 1.5707963) * 32768.0);
+        sinTab_[kTab + 1] = sinTab_[kTab];
+        Reset();
     }
 
-    /// Call once per audio block, before Process().
-    void SetParams(const Params &p)
+    /// Silence and rewind (not for the audio loop: clears 200 kB)
+    void Reset()
     {
-        p_ = p;
-        if (p_.cycle_len < kMinCycle)
-            p_.cycle_len = kMinCycle;
-        if (p_.cycle_len > kMaxCycle)
-            p_.cycle_len = kMaxCycle;
-        if (p_.repeats < 1)
-            p_.repeats = 1;
-        if (p_.repeats > kMaxRepeats)
-            p_.repeats = kMaxRepeats;
+        rng_.seed(1234);
+        std::memset(BL, 0, sizeof(int16_t) * kBufferLen);
+        std::memset(BR, 0, sizeof(int16_t) * kBufferLen);
+        const double sr = sr_;
+        giFade = 0.003 * sr;
+        fadeI_ = (int32_t)std::lround(giFade);
+        iX = roundEven(0.004 * sr);
+        iPre = roundEven(0.0035 * sr);
+        iMinL = roundEven(0.0125 * sr);
+        iMaxL = ffloor((kHist - 2 * iX - 2 * KS - 64) / 2);
+        iMaxP = iMaxL / sr;
+        kBoot = 1; kG = 0; kW = 0; kT = 0; kLc = iMinL; kLe = iMinL; kNc = 1; kSc = iMinL; kLnomC = iMinL; kCarry = 0;
+        kRc = 0; kPassS = 1; kPassC = 1; kFzOn = 0; kFzA = 0; kFzStop = 0; kSpEnd = 0; kFza = 0; kFzG = 0; kFzX = 0;
+        kMc = 0; kMtrC = 0; kJmpC = 0; kRjC = 0; kSpdC = 1; kSilC = 0; kJmpN = 0; kRjN = 0; kSpdN = 1; kSilN = 0;
+        kXP = 1; kXlaw = 0; kTo = 0; kLoE = iMinL; kLoC = iMinL; kSo = iMinL; kMo = 0; kSpdo = 1; kSilo = 0;
+        kOLive = 1; kAo = 0; kao = 0; kXso = 0; kPasso = 1; kSince = 0; kMovT = 0; kTsX = 0;
+        kTnew2 = kBnd1 = kFzAn = kLnew = kTnew = kHq = kFzNx = kPassEo = kLiveO = kLiveN = kTb = kHp = kE = 0;
+        kR1 = kR2 = kR3 = kR4 = kXs = kWadv = 0;
+        tsChanged_ = ChangeDetect();
+        fzChanged_ = ChangeDetect();
+        mixC_ = std::pow(0.5, (KS / sr) / 0.02);
+        mixY_ = 0;
+        dsNext_ = 0;
+        dsCount_ = 0;
+        dsHeldL_ = dsHeldR_ = 0;
+        timeCached_ = -1;
+        corCached_ = -1;
+        beatsUsed_ = 1;
+        cycleFlag_ = sliceFlag_ = false;
     }
 
-    /// Start a new cycle now (clock / reset). Ignored if a cycle started very recently.
-    void Realign()
+    void SetParam(int id, double v)
     {
-        if (t_ >= kFade)
-            force_boundary_ = true;
+        if (id >= 0 && id < COUNT)
+            prm_[id] = v;
+    }
+    double GetParam(int id) const { return prm_[id]; }
+    /// bpm 0 = no tempo (120 is used); timeSec = song position, SYNC locks to it while it keeps moving
+    void SetTransport(double bpm, double time_sec)
+    {
+        bpm_ = bpm;
+        ts_ = time_sec;
     }
 
-    /// Interleaved stereo in / out (in[2*i] = left, in[2*i+1] = right), Q15 values in int16_t or int32_t.
-    /// in and out may be the same buffer.
-    template <typename T>
-    void Process(const T *in, T *out, size_t n)
-    {
-        // mix: ramp across the block to avoid zipper noise; FREEZE / HOLD are always fully wet (as in LAZERS)
-        // Q15 with 32768 = fully wet, so a full mix is bit-exact
-        const int32_t mix_target = (frozen_ || hold_ || p_.hold || p_.mix >= 32767) ? 32768 : (p_.mix < 0 ? 0 : p_.mix);
-        const int32_t mix_start = mix_;
-        const int32_t mix_step = (mix_target - mix_start) / static_cast<int32_t>(n == 0 ? 1 : n);
-
-        // DAMAGE settings (per block)
-        const int32_t d = p_.damage;
-        const bool dmg_on = d > 80;
-        const int32_t dmg_inc = kOne + static_cast<int32_t>((static_cast<int64_t>(d) * d * 24 * kOne) / (4095 * 4095));
-        const int32_t dmg_bits = (d * 12) / 4095;
-        const int32_t dmg_mask = ~((1 << dmg_bits) - 1);
-
-        // HOLD edge: start (instant). Release: crossfade back.
-        if (p_.hold && !hold_)
-        {
-            hold_ = true;
-            hold_len_ = S_ < kMinCycle ? kMinCycle : S_;
-            if (hold_len_ > kMaxCycle)
-                hold_len_ = kMaxCycle;
-            hold_start_ = Wrap(w_ - hold_len_);
-            hold_pos_ = 0;
-            writing_ = false;
-        }
-        else if (!p_.hold && hold_)
-        {
-            hold_ = false;
-            if (!frozen_)
-                writing_ = true;
-        }
-
-        for (size_t i = 0; i < n; i++)
-        {
-            const int32_t inL = Sat16(static_cast<int32_t>(in[2 * i]));
-            const int32_t inR = Sat16(static_cast<int32_t>(in[2 * i + 1]));
-
-            // ---- cycle / slice clock ----
-            if (t_ >= L_ || force_boundary_)
-                CycleStart();
-            int32_t k = t_ / S_;
-            if (k >= R_)
-                k = R_ - 1;
-            if (k != k_)
-                SliceStart(k);
-            const int32_t s = t_ - k_ * S_; // position inside the slice
-
-            // ---- record (before reading, so a live slice reads this very sample) ----
-            if (writing_)
-            {
-                buf_[0][w_] = static_cast<int16_t>(inL);
-                buf_[1][w_] = static_cast<int16_t>(inR);
-                w_ = Wrap(w_ + 1);
-            }
-
-            // ---- normal path (slices) ----
-            int32_t wetL, wetR;
-            ReadSlice(s, wetL, wetR);
-
-            // ---- HOLD path, crossfaded in / out over kFade samples ----
-            if (hold_ || hold_x_ > 0)
-            {
-                int32_t hL, hR;
-                const int32_t idx = Wrap(hold_start_ + hold_pos_);
-                const int32_t env = EdgeEnv(hold_pos_, hold_len_, true, true);
-                hL = (buf_[0][idx] * env) >> 15;
-                hR = (buf_[1][idx] * env) >> 15;
-                hold_pos_++;
-                if (hold_pos_ >= hold_len_)
-                    hold_pos_ = 0;
-                if (hold_ && hold_x_ < kFade)
-                    hold_x_++;
-                else if (!hold_ && hold_x_ > 0)
-                    hold_x_--;
-                const int32_t g = (hold_x_ * 32768) / kFade;
-                wetL = ((hL * g) + (wetL * (32768 - g))) >> 15;
-                wetR = ((hR * g) + (wetR * (32768 - g))) >> 15;
-            }
-
-            // ---- DAMAGE ----
-            if (dmg_on)
-            {
-                dmg_acc_ += kOne;
-                if (dmg_acc_ >= dmg_inc)
-                {
-                    dmg_acc_ -= dmg_inc;
-                    dmg_hold_[0] = wetL & dmg_mask;
-                    dmg_hold_[1] = wetR & dmg_mask;
-                }
-                wetL = dmg_hold_[0];
-                wetR = dmg_hold_[1];
-            }
-
-            // ---- mix ----
-            const int32_t m = mix_start + mix_step * static_cast<int32_t>(i);
-            int32_t oL = ((inL * (32768 - m)) + (wetL * m)) >> 15;
-            int32_t oR = ((inR * (32768 - m)) + (wetR * m)) >> 15;
-            out[2 * i] = static_cast<T>(Sat16(oL));
-            out[2 * i + 1] = static_cast<T>(Sat16(oR));
-
-            t_++;
-        }
-        mix_ = mix_target;
-    }
-
-    // ---- status, for LEDs and outputs (read and cleared by the UI) ----
+    bool Frozen() const { return kFzOn >= 0.5; }
+    /// true while the input passes straight through (one slice, nothing random, not frozen)
+    bool Passing() const { return kPassS >= 0.5 && kFzOn < 0.5; }
+    double MaxCycleSeconds() const { return iMaxP; }
+    /// the SYNC note length in beats after halving
+    double SyncBeats() const { return beatsUsed_; }
     bool TakeCycleFlag()
     {
-        const bool f = cycle_flag_;
-        cycle_flag_ = false;
+        bool f = cycleFlag_;
+        cycleFlag_ = false;
         return f;
     }
     bool TakeSliceFlag()
     {
-        const bool f = slice_flag_;
-        slice_flag_ = false;
+        bool f = sliceFlag_;
+        sliceFlag_ = false;
         return f;
     }
-    State GetState() const
+
+    /// One block of KS samples per channel, 16-bit values (32768 = 1.0) in int32.  in and out may be the same arrays.
+    BRK_COMPACT void ProcessBlock(const int32_t *inL, const int32_t *inR, int32_t *outL, int32_t *outR)
     {
-        if (hold_)
-            return State::HOLD;
-        if (frozen_)
-            return State::FROZEN;
-        return cur_.live ? State::LIVE : State::REPEATING;
+        for (int n = 0; n < KS; n++)
+        {
+            xL_[n] = clamp16(inL[n]);
+            xR_[n] = clamp16(inR[n]);
+        }
+        const double ksmps = KS, sr = sr_;
+        const double *P = prm_;
+        double kMix = P[MIX], kTime = P[TIME], kRep = P[REPEATS], kTrv = P[POSITION], kBrk = P[BRAEK],
+               kBnd = P[WONK], kCor = P[DAMAGE], kFrz = P[FREEZE], kFrzH = P[FREEZEHOLD], kHold = P[HOLD],
+               kSyn = P[SYNC], kBpm = bpm_, kTs = ts_;
+        double kMov = tsChanged_(kTs) ? 1 : 0;
+        kSince = (kMov == 1 ? 0 : kSince + ksmps / sr);
+        kMovT = (kMov == 1 ? 0.25 : kMovT - ksmps / sr);
+        kTsX = kTs + kSince;
+        double kBpmU = (kBpm > 20 && kBpm < 400 ? kBpm : 120);
+
+        double kIx = clampLo(truncTo0(kTime * 9.999), 0, 9);
+        double kBeats = kSyncT[(int)kIx];
+        if (kSyn >= 0.5)
+        {
+            // port: halve a note that is too long for the memory (stays on the beat)
+            while (kBeats * 60 / kBpmU > iMaxP && kBeats > 0.07)
+                kBeats *= 0.5;
+        }
+        beatsUsed_ = kBeats;
+        if (kTime != timeCached_)
+        {
+            timeCached_ = kTime;
+            freePer_ = 0.0125 * std::exp(std::log(320.0) * kTime);
+        }
+        double kPerS = (kSyn >= 0.5 ? kBeats * 60 / kBpmU : freePer_);
+        double kPerL = clampLo(kPerS, 0.0125, iMaxP);
+        double kLnomE = kPerL * sr;
+        double kNn = clampLo(roundEven(kRep), 1, 16);
+        double kHoldM = (kHold >= 0.5 ? 1 : 0);
+        double kReqH = (kFrzH >= 0.5 || kFrz >= 0.5 ? 1 : 0);
+        double kReq = (kHoldM == 1 ? kReqH : (kFrz >= 0.5 ? 1 : 0));
+        double kSyncOK = (kSyn >= 0.5 && kMovT > 0 && kPerS <= iMaxP ? 1 : 0);
+        double kBB = (kBnd <= 0.001 && kBrk <= 0.001 ? 1 : 0);
+
+        if (kBoot == 1)
+        {
+            kBoot = 0;
+            kLc = roundEven(kLnomE);
+            kLe = kLc;
+            kLnomC = kLnomE;
+            kNc = kNn;
+            kSc = kLc / kNc;
+            kMtrC = roundEven(kTrv * (kNc - 1));
+            kMc = kMtrC;
+            kPassC = (kNc == 1 && kBB == 1 ? 1 : 0);
+            kPassS = kPassC;
+            kRc = -1;
+        }
+
+        double kChN = (kNn != kNc ? 1 : 0);
+        double kChL = (std::fabs(kLnomE - kLnomC) > 0.01 * kLnomC ? 1 : 0);
+        double kMtr = roundEven(kTrv * (kNn - 1));
+        double kChM = (kMtr != kMtrC ? 1 : 0);
+        double kChF = (kHoldM == 1 && kReq != kFzOn ? 1 : 0);
+        if (kXP >= 1 && kChN + kChL + kChM + kChF > 0)
+        {
+            kTo = kT; kLoE = kLe; kLoC = kLc; kSo = kSc; kMo = kMc; kSpdo = kSpdC; kSilo = kSilC;
+            kOLive = 1 - kFzOn; kAo = kFzA; kao = kFza; kXso = kFzX * kFzOn;
+            kFzNx = (kHoldM == 0 ? kReq : kFzOn);
+            kPassEo = kPassC * (kNc == 1 && kFzNx == 0 && kBB == 1 ? 1 : 0);
+            kPasso = (kT >= kLe * 0.5 ? kPassEo : kPassS);
+            kXP = 0;
+            kXlaw = 0;
+            if (kChL == 1)
+            {
+                kLnew = clampLo(roundEven(kLnomE), iMinL, iMaxL);
+                if (kSyncOK == 1)
+                {
+                    kHq = kTsX * kBpmU / (60 * kBeats) + iPre / kLnew;
+                    kTnew = roundEven((kHq - ffloor(kHq)) * kLnew);
+                }
+                else
+                {
+                    kTnew = roundEven(kT / kLe * kLnew);
+                }
+                kTnew = clampLo(kTnew, 0, kLnew - 1);
+                if (kFzOn == 1)
+                {
+                    kFza = kTnew - (kG - kFzG);
+                    kFza = kFza - kLnew * ffloor(kFza / kLnew);
+                }
+                if (kSyncOK == 0 && std::fabs(kLnew - kLoE) < 0.1 * kLoE)
+                    kXlaw = 1;
+                kT = kTnew; kLc = kLnew; kLe = kLnew; kLnomC = kLnomE;
+            }
+            kNc = kNn;
+            kSc = kLc / kNc;
+            kMtrC = roundEven(kTrv * (kNc - 1));
+            kMc = (kJmpC == 1 && kBrk > 0.001 ? truncTo0(kRjC * kNc) : kMtrC);
+            kMc = clampLo(kMc, 0, kNc - 1);
+            if (kChF == 1)
+            {
+                if (kReq == 1)
+                {
+                    kFzOn = 1; kFzA = kW; kFzStop = kW + iX; kFzG = kG;
+                    kFza = kT - kLc * ffloor(kT / kLc);
+                    kFzX = iX;
+                    if (kChN + kChL + kChM == 0 && ffloor(kT / kSc) != kMc)
+                        kXP = 1;
+                }
+                else
+                {
+                    kFzOn = 0; kW = kFzA; kSpEnd = kFzA + iX;
+                }
+            }
+            kPassC = (kNc == 1 && kFzOn == 0 && kBB == 1 ? 1 : 0);
+            kPassS = kPassS * kPassC;
+            kLiveO = (kOLive == 1 && ffloor(kTo / kSo) == kMo && kSpdo == 1 ? 1 : 0);
+            kLiveN = (kFzOn == 0 && ffloor(kT / kSc) == kMc && kSpdC == 1 ? 1 : 0);
+            if (kLiveO == 1 && kLiveN == 1)
+                kXlaw = 1;
+            kRc = (kT > 0 ? ffloor((kT - 1) / kSc) : -1);
+        }
+
+        double kCross = (kT + ksmps > kLe ? 1 : 0);
+        double kJ = kLe - kT;
+        double kFzNext = (kHoldM == 0 ? kReq : kFzOn);
+        double kLn = kLc;
+        if (kCross == 1)
+        {
+            if (kSyncOK == 1)
+            {
+                kTb = kTsX + kJ / sr;
+                kHp = kTb * kBpmU / (60 * kBeats) + iPre / kLnomE;
+                kE = kHp - roundEven(kHp);
+                kLn = roundEven(kLnomE * (1 - kE));
+            }
+            else
+            {
+                kLn = roundEven(kLnomE + kCarry);
+                kCarry = kLnomE + kCarry - kLn;
+            }
+            kLn = clampLo(kLn, iMinL, iMaxL);
+        }
+        double kSn = kLn / kNc;
+        double kPassN = (kNc == 1 && kFzNext == 0 && kBB == 1 ? 1 : 0);
+        double kPassE = kPassC * kPassN;
+        double kEng = (kCross == 1 && kFzOn == 0 && kFzNext == 1 ? 1 : 0);
+        double kRel = (kCross == 1 && kFzOn == 1 && kFzNext == 0 ? 1 : 0);
+
+        // ---- per-sample clock (integers) ----
+        double kMbN = roundEven(kTrv * (kNc - 1));
+        double kMn = (kBrk > 0.001 && kJmpN == 1 ? truncTo0(kRjN * kNc) : kMbN);
+        kMn = clampLo(kMn, 0, kNc - 1);
+        {
+            const int32_t iT = (int32_t)kT, iLe = (int32_t)kLe, iLc = (int32_t)kLc, iLn = (int32_t)kLn;
+            const uint32_t sc16 = q16(kSc), sn16 = q16(kSn);
+            const int32_t iRc = (int32_t)kRc, mx = (int32_t)kNc - 1, iMc = (int32_t)kMc, iMn = (int32_t)kMn;
+            const int32_t hC = halfSpeed(kSpdC), hN = halfSpeed(kSpdN);
+            const int32_t ngC = kSpdC < 0, ngN = kSpdN < 0, slC = kSilC >= 0.5, slN = kSilN >= 0.5;
+            const bool cross = kCross == 1;
+            for (int n = 0; n < KS; n++)
+            {
+                const int32_t t = iT + n;
+                const int32_t k = (cross && t >= iLe) ? 1 : 0;
+                K_[n] = k;
+                Tp_[n] = t - k * iLe;
+                Sp_[n] = k ? sn16 : sc16;
+                Lp_[n] = k ? iLn : iLc;
+                Lh_[n] = k ? iLn : iLe;
+                const uint32_t tp16 = (uint32_t)Tp_[n] << 16;
+                const uint32_t rx = tp16 / Sp_[n];
+                U_[n] = tp16 - rx * Sp_[n];
+                const int32_t nw = (k || (int32_t)rx - iRc >= 1) ? 1 : 0;
+                int32_t m = nw ? iMn : iMc;
+                M_[n] = m < 0 ? 0 : (m > mx ? mx : m);
+                H_[n] = nw ? hN : hC;
+                Ng_[n] = nw ? ngN : ngC;
+                Sil_[n] = nw ? slN : slC;
+            }
+        }
+
+        // ---- record ----
+        if (kRel == 1)
+            kSpEnd = kFzA + iX;
+        double kJ0 = (kRel == 1 ? kJ : 0);
+        double kWb = (kRel == 1 ? kFzA : kW);
+        double kWe0 = 1; // 1: every sample written; 0: aK decides (release); -1: up to kFzStop (frozen)
+        if (kFzOn == 0)
+        {
+            kWadv = ksmps;
+        }
+        else if (kRel == 1)
+        {
+            kWe0 = 0;
+            kWadv = ksmps - kJ;
+        }
+        else
+        {
+            kWe0 = -1;
+            kWadv = clampLo(kFzStop - kW, 0, ksmps);
+        }
+        const int32_t wmod = histMod(kWb - kJ0); // history index of aW[0]
+        double kSpl = (kWb < kSpEnd ? 1 : 0);
+        if (kWadv >= ksmps && kSpl == 0)
+        {
+            int32_t i = wmod;
+            for (int n = 0; n < KS; n++)
+            {
+                BL[i] = (int16_t)xL_[n];
+                BR[i] = (int16_t)xR_[n];
+                if (++i == kHist)
+                    i = 0;
+            }
+        }
+        else if (kWadv > 0)
+        {
+            const int32_t iXi = (int32_t)iX;
+            const int32_t ph0 = clampBig(kWb - kJ0 - kSpEnd + iX); // aW - kSpEnd + iX at n = 0
+            const int32_t stop0 = clampBig(kFzStop - (kWb - kJ0)); // kFzStop - aW at n = 0
+            int32_t i = wmod;
+            for (int n = 0; n < KS; n++)
+            {
+                const bool we = kWe0 > 0 ? true : (kWe0 == 0 ? K_[n] != 0 : (stop0 - n >= 1));
+                if (we)
+                {
+                    const int32_t d = ph0 + n;
+                    const int32_t g = d <= 0 ? 0 : (d >= iXi ? 32768 : (int32_t)(((uint32_t)d << 15) / (uint32_t)iXi));
+                    int32_t s1, s0;
+                    sinCos(g, s1, s0);
+                    BL[i] = (int16_t)clamp16((xL_[n] * s1 + BL[i] * s0) >> 15);
+                    BR[i] = (int16_t)clamp16((xR_[n] * s1 + BR[i] * s0) >> 15);
+                }
+                if (++i == kHist)
+                    i = 0;
+            }
+        }
+        BL[kHist] = BL[0];
+        BR[kHist] = BR[0];
+
+        // ---- play: the current mapping ----
+        if (kFzOn == 0)
+        {
+            kFzAn = kW + kJ;
+            const int32_t anMod = histMod(kFzAn);
+            const bool eng = kEng == 1;
+            int32_t i = wmod;
+            for (int n = 0; n < KS; n++)
+            {
+                const bool e = eng && K_[n];
+                Am_[n] = e ? anMod : i;
+                AA_[n] = e ? 0 : Tp_[n];
+                if (++i == kHist)
+                    i = 0;
+            }
+            kXs = 0;
+        }
+        else if (kRel == 1)
+        {
+            const int32_t aMod = histMod(kFzA), ia = (int32_t)kFza;
+            int32_t i = wmod;
+            for (int n = 0; n < KS; n++)
+            {
+                Am_[n] = K_[n] ? i : aMod;
+                AA_[n] = K_[n] ? Tp_[n] : ia;
+                if (++i == kHist)
+                    i = 0;
+            }
+            kXs = 0;
+        }
+        else
+        {
+            const int32_t aMod = histMod(kFzA), ia = (int32_t)kFza;
+            for (int n = 0; n < KS; n++)
+            {
+                Am_[n] = aMod;
+                AA_[n] = ia;
+            }
+            kXs = kFzX;
+        }
+        rdMap(U_, Sp_, M_, H_, Ng_, Lp_, Am_, AA_, (int32_t)kXs, NL_, NR_, NW_);
+        {
+            const int32_t pS = kPassS >= 0.5, pE = kPassE >= 0.5, pN = kPassN >= 0.5;
+            for (int n = 0; n < KS; n++)
+            {
+                const bool half = 2 * Tp_[n] > Lh_[n];
+                const int32_t ps = K_[n] ? pE : pS;
+                const int32_t pe = K_[n] ? pN : pE;
+                const int32_t pass = half ? pe : ps;
+                NW_[n] = Sil_[n] ? 0 : (pass ? 32768 : NW_[n]);
+            }
+        }
+        if (kXP < 1)
+        {
+            // the old mapping, crossfaded out over 4 ms
+            const int32_t iTo = (int32_t)kTo, iLoE = (int32_t)kLoE, iLoC = (int32_t)kLoC, iMo = (int32_t)kMo;
+            const uint32_t so16 = q16(kSo);
+            const int32_t hO = halfSpeed(kSpdo), ngO = kSpdo < 0;
+            const bool live = kOLive == 1;
+            const int32_t aoMod = histMod(kAo), iao = (int32_t)kao;
+            int32_t i = wmod;
+            for (int n = 0; n < KS; n++)
+            {
+                int32_t t = iTo + n;
+                while (t >= iLoE)
+                    t -= iLoE;
+                const uint32_t tp16 = (uint32_t)t << 16;
+                const uint32_t rx = tp16 / so16;
+                U_[n] = tp16 - rx * so16;
+                Sp_[n] = so16;
+                M_[n] = iMo;
+                H_[n] = hO;
+                Ng_[n] = ngO;
+                Lp_[n] = iLoC;
+                Am_[n] = live ? i : aoMod;
+                AA_[n] = live ? t : iao;
+                if (++i == kHist)
+                    i = 0;
+            }
+            rdMap(U_, Sp_, M_, H_, Ng_, Lp_, Am_, AA_, (int32_t)kXso, OL_, OR_, OW_);
+            const int32_t xp0 = (int32_t)std::lround(kXP * 65536.0), xpStep = (int32_t)std::lround(65536.0 / iX);
+            const bool lin = kXlaw >= 0.5;
+            const int32_t silo = kSilo >= 0.5, passo = kPasso >= 0.5;
+            for (int n = 0; n < KS; n++)
+            {
+                int32_t x = xp0 + n * xpStep;
+                x = x < 0 ? 0 : (x > 65536 ? 65536 : x);
+                const int32_t g = x >> 1;
+                int32_t gn, go;
+                if (lin)
+                {
+                    gn = g;
+                    go = 32768 - g;
+                }
+                else
+                {
+                    sinCos(g, gn, go);
+                }
+                const int32_t ow = silo ? 0 : (passo ? 32768 : OW_[n]);
+                WL_[n] = (((NL_[n] * NW_[n]) >> 15) * gn >> 15) + (((OL_[n] * ow) >> 15) * go >> 15);
+                WR_[n] = (((NR_[n] * NW_[n]) >> 15) * gn >> 15) + (((OR_[n] * ow) >> 15) * go >> 15);
+            }
+            kXP = kXP + ksmps / iX;
+            kTo = kTo + ksmps;
+            kTo = kTo - kLoE * ffloor(kTo / kLoE);
+        }
+        else
+        {
+            for (int n = 0; n < KS; n++)
+            {
+                WL_[n] = (NL_[n] * NW_[n]) >> 15;
+                WR_[n] = (NR_[n] * NW_[n]) >> 15;
+            }
+        }
+
+        // ---- advance the clock state ----
+        double kTl = kT + ksmps - 1;
+        double kRold = kRc;
+        if (kTl >= kLe)
+        {
+            kTnew2 = kTl + 1 - kLe;
+            kRc = ffloor((kTl - kLe) / kSn);
+            kBnd1 = 1;
+            if (kEng == 1)
+            {
+                kFzOn = 1; kFzA = kW + kJ; kFzStop = kFzA + iX; kFza = 0; kFzG = kG + kJ; kFzX = iX;
+            }
+            else if (kRel == 1)
+            {
+                kFzOn = 0;
+            }
+            kLc = kLn; kLe = kLn; kSc = kSn; kPassS = kPassE; kPassC = kPassN; kT = kTnew2;
+            cycleFlag_ = true;
+        }
+        else
+        {
+            kRc = ffloor(kTl / kSc);
+            kBnd1 = (kRc != kRold ? 1 : 0);
+            kT = kTl + 1;
+        }
+        kW = kWb + kWadv;
+        kG = kG + ksmps;
+        if (kBnd1 == 1)
+        {
+            sliceFlag_ = true;
+            kMc = kMn; kJmpC = kJmpN; kRjC = kRjN; kSpdC = kSpdN; kSilC = kSilN; kMtrC = kMbN;
+            kR1 = rng_.range(0, 1);
+            kJmpN = (kR1 < kBrk ? 1 : 0);
+            kRjN = rng_.range(0, 0.9999);
+            kR2 = rng_.range(0, 1);
+            kSilN = (kR2 < kBrk * 0.9 ? 1 : 0);
+            kR3 = rng_.range(0, 1);
+            if (kR3 < kBnd)
+            {
+                kR4 = rng_.range(0, 1);
+                if (kR4 < 0.2) kSpdN = -1;
+                else if (kR4 < 0.4) kSpdN = 0.5;
+                else if (kR4 < 0.55) kSpdN = 2;
+                else if (kR4 < 0.7) kSpdN = -0.5;
+                else if (kR4 < 0.85) kSpdN = 1.5;
+                else kSpdN = -2;
+            }
+            else
+            {
+                kSpdN = 1;
+            }
+        }
+        if (kBrk <= 0.001)
+        {
+            kSilN = 0;
+            kJmpN = 0;
+        }
+        if (kBnd <= 0.001)
+            kSpdN = 1;
+
+        // ---- DAMAGE: sample-rate + bit reduction of the wet signal ----
+        if (kCor > 0.02)
+        {
+            if (kCor != corCached_)
+            {
+                corCached_ = kCor;
+                dsStep_ = (int32_t)std::lround((1 + kCor * kCor * 24) * 65536.0);
+                const double steps = std::exp(std::log(2.0) * (16 - 12 * kCor));
+                const double q = 32768.0 / steps; // one quantiser step in 16-bit units
+                qStep8_ = q > 1.0 ? (int32_t)std::lround(q * 256.0) : 0;
+            }
+            for (int n = 0; n < KS; n++)
+            {
+                if (dsNext_ < dsCount_)
+                {
+                    dsNext_ += dsStep_;
+                    dsHeldL_ = WL_[n];
+                    dsHeldR_ = WR_[n];
+                }
+                WL_[n] = dsHeldL_;
+                WR_[n] = dsHeldR_;
+                dsCount_ += 65536;
+            }
+            dsNext_ -= dsCount_; // keep the counters small (only their difference matters)
+            dsCount_ = 0;
+            if (qStep8_ > 0)
+            {
+                const int32_t q = qStep8_, h = q >> 1;
+                for (int n = 0; n < KS; n++)
+                {
+                    WL_[n] = quant(WL_[n], q, h);
+                    WR_[n] = quant(WR_[n], q, h);
+                }
+            }
+        }
+
+        // ---- mix (engaging FREEZE with MIX at 0 jumps to fully wet) ----
+        double kMixE = (kReq == 1 && kMix < 0.02 ? 1 : kMix);
+        mixY_ = (1.0 - mixC_) * kMixE + mixC_ * mixY_;
+        fzChanged_(kFzOn);
+        int32_t m = (int32_t)std::lround(mixY_ * 32768.0);
+        m = m < 0 ? 0 : (m > 32768 ? 32768 : m);
+        for (int n = 0; n < KS; n++)
+        {
+            const int32_t l = xL_[n], r = xR_[n];
+            outL[n] = clamp16(l + (((clamp16(WL_[n]) - l) * m) >> 15));
+            outR[n] = clamp16(r + (((clamp16(WR_[n]) - r) * m) >> 15));
+        }
     }
-    int32_t GetCycleLength() const { return L_; }
 
 private:
-    struct Slice
-    {
-        int32_t m = 0;       ///< which slice of the cycle to read
-        int32_t speed = kOne; ///< Q8, negative = backwards
-        bool silent = false;
-        bool jumped = false; ///< BRAEK jump: m was chosen at random
-        bool live = true;    ///< continuous with the input (reads its own time, speed 1, not silent, not frozen)
-    };
+    static constexpr int kTab = 1024;
 
-    static inline int32_t Wrap(int32_t x)
+    static inline int32_t clamp16(int32_t x) { return x < -32768 ? -32768 : (x > 32767 ? 32767 : x); }
+    static inline uint32_t q16(double x) { return (uint32_t)(x * 65536.0 + 0.5); }
+    static inline int32_t halfSpeed(double spd) { return (int32_t)(std::fabs(spd) * 2 + 0.5); } // |speed| x 2: 1..4
+    static inline int32_t clampBig(double x)
     {
-        while (x < 0)
-            x += kBufLen;
-        while (x >= kBufLen)
-            x -= kBufLen;
-        return x;
+        return x < -1073741824.0 ? -1073741824 : (x > 1073741824.0 ? 1073741824 : (int32_t)x);
+    }
+    static inline int32_t histMod(double x) // x is a whole number
+    {
+        int32_t r = (int32_t)((int64_t)x % kHist);
+        return r < 0 ? r + kHist : r;
+    }
+    static BRK_INLINE int32_t wrapH(int32_t i)
+    {
+        while (i < 0)
+            i += kHist;
+        while (i >= kHist)
+            i -= kHist;
+        return i;
+    }
+    static inline int32_t quant(int32_t x, int32_t q, int32_t h)
+    {
+        const int32_t v = x * 256;
+        const int32_t k = (v >= 0 ? v + h : v - h) / q;
+        return (k * q) >> 8;
+    }
+    // sin and cos of g x 90 degrees, g in Q15 (0..32768), results Q15
+    BRK_INLINE void sinCos(int32_t g, int32_t &s, int32_t &c) const
+    {
+        const int32_t i = g >> 5, f = g & 31;
+        s = sinTab_[i] + (((sinTab_[i + 1] - sinTab_[i]) * f) >> 5);
+        const int32_t gc = 32768 - g, j = gc >> 5, fc = gc & 31;
+        c = sinTab_[j] + (((sinTab_[j + 1] - sinTab_[j]) * fc) >> 5);
+    }
+    static BRK_INLINE int32_t rd(const int16_t *B, int32_t i, int32_t xf)
+    {
+        const int32_t a = B[i], b = B[i + 1];
+        return a + (((b - a) * (xf >> 2)) >> 14);
     }
 
-    static inline int16_t Sat16(int32_t x)
+    // LAZERS RdMap: where in the history each output sample is read, and its window (fade at slice edges).
+    // U: position in the slice (Q16), Sp: slice length (Q16), M: slice number, H: |speed| x 2, Ng: backwards,
+    // Lc: cycle length, Am: history index of the mapping's anchor, aa: anchor offset, xs: freeze seam crossfade.
+    BRK_FAST BRK_HOT void rdMap(const uint32_t *U, const uint32_t *Sp, const int32_t *M, const int32_t *H, const int32_t *Ng,
+                        const int32_t *Lc, const int32_t *Am, const int32_t *aa, int32_t xs, int32_t *oL, int32_t *oR,
+                        int32_t *win) const
     {
-        return static_cast<int16_t>(x > 32767 ? 32767 : (x < -32768 ? -32768 : x));
-    }
-
-    inline uint32_t Rand()
-    {
-        uint32_t x = rng_;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        rng_ = x;
-        return x;
-    }
-    /// Random number 0..4095
-    inline int32_t Rand12() { return static_cast<int32_t>(Rand() >> 20); }
-
-    /// Fade envelope (Q15, 32768 = 1.0 so full level is bit-exact) for position s in a slice of length len.
-    static inline int32_t EdgeEnv(int32_t s, int32_t len, bool fade_in, bool fade_out)
-    {
-        int32_t f = kFade;
-        if (2 * f > len)
-            f = len / 2;
-        if (f < 1)
-            return 32768;
-        int32_t e = 32768;
-        if (fade_in && s < f)
-            e = (s * 32768) / f;
-        if (fade_out && (len - 1 - s) < f)
+        const uint32_t fade16 = (uint32_t)fadeI_ << 16;
+        const int32_t xs16 = xs << 16;
+        for (int n = 0; n < KS; n++)
         {
-            const int32_t e2 = ((len - 1 - s) * 32768) / f;
-            if (e2 < e)
-                e = e2;
-        }
-        return e;
-    }
-
-    int32_t PositionSlice(int32_t R) const
-    {
-        // 0..4095 -> 0..R-1, rounded
-        return (p_.position * (R - 1) + 2047) / 4095;
-    }
-
-    /// Decide what slice k (of R) will play.
-    Slice MakeSlice(int32_t k, int32_t R, bool will_be_frozen)
-    {
-        Slice sl;
-        sl.m = PositionSlice(R);
-        if (p_.braek > 16)
-        {
-            sl.jumped = Rand12() < p_.braek;
-            if (sl.jumped)
-                sl.m = static_cast<int32_t>((static_cast<uint32_t>(Rand12()) * static_cast<uint32_t>(R)) >> 12);
-            if (Rand12() < (p_.braek * 9) / 10)
-                sl.silent = true;
-        }
-        if (p_.wonk > 16 && Rand12() < p_.wonk)
-        {
-            const int32_t r = Rand12();
-            if (r < 819)
-                sl.speed = -kOne; // backwards
-            else if (r < 1638)
-                sl.speed = kOne / 2; // half speed
-            else if (r < 2253)
-                sl.speed = 2 * kOne; // double speed
-            else if (r < 2867)
-                sl.speed = -kOne / 2; // half speed backwards
-            else if (r < 3481)
-                sl.speed = (3 * kOne) / 2; // a fifth up
+            const uint32_t sp = Sp[n], u = U[n];
+            uint32_t p;
+            switch (H[n])
+            {
+            case 1: p = u >> 1; break;
+            case 3: p = u + (u >> 1); break;
+            case 4: p = u << 1; break;
+            default: p = u; break;
+            }
+            if (p >= sp)
+                p -= sp;
+            const uint32_t s = Ng[n] ? sp - p : p;
+            const int32_t x16 = M[n] * (int32_t)sp + (int32_t)s;
+            const int32_t xi = x16 >> 16, xf = x16 & 0xFFFF;
+            const int32_t d = x16 - (aa[n] << 16);
+            const int32_t base = Am[n] - aa[n] + xi;
+            if (xs > 0)
+            {
+                const int32_t dd = d + xs16;
+                const int32_t g = dd <= 0 ? 0 : (dd >= xs16 ? 32768 : (int32_t)(((uint32_t)dd / (uint32_t)xs) >> 1));
+                int32_t g2, g1;
+                sinCos(g, g2, g1);
+                const int32_t i1 = wrapH(base), i2 = wrapH(base - Lc[n]);
+                oL[n] = (rd(BL, i1, xf) * g1 + rd(BL, i2, xf) * g2) >> 15;
+                oR[n] = (rd(BR, i1, xf) * g1 + rd(BR, i2, xf) * g2) >> 15;
+            }
             else
-                sl.speed = -2 * kOne; // double speed backwards
-        }
-        sl.live = !will_be_frozen && sl.m == k && sl.speed == kOne && !sl.silent;
-        return sl;
-    }
-
-    void CycleStart()
-    {
-        force_boundary_ = false;
-        cycle_flag_ = true;
-        const int32_t prev_cs = cs_;
-        const int32_t prev_L = L_;
-
-        // FREEZE engage / release, at the cycle start
-        if (p_.freeze && !frozen_)
-        {
-            frozen_ = true;
-            writing_ = false;
-            // loop the cycle that just finished: from the previous cycle start to the write head
-            (void)prev_L;
-            cs_ = prev_cs;
-            L_ = Wrap(w_ - prev_cs);
-            if (L_ < kMinCycle)
-                L_ = kMinCycle;
-            if (L_ > kMaxCycle)
-                L_ = kMaxCycle;
-        }
-        else if (!p_.freeze && frozen_)
-        {
-            frozen_ = false;
-            if (!hold_)
-                writing_ = true;
-            cs_ = w_;
-            L_ = p_.cycle_len;
-        }
-        else if (frozen_)
-        {
-            // stay on the same frozen cycle
-        }
-        else
-        {
-            cs_ = w_;
-            L_ = p_.cycle_len;
-        }
-        R_ = p_.repeats;
-        if (R_ > L_ / (2 * kFade))
-            R_ = L_ / (2 * kFade) < 1 ? 1 : L_ / (2 * kFade); // keep slices long enough for the fades
-        S_ = L_ / R_;
-        L_ = S_ * R_; // whole slices only
-        t_ = 0;
-        k_ = -1;
-        SliceStart(0);
-    }
-
-    void SliceStart(int32_t k)
-    {
-        slice_flag_ = true;
-        // The edge into this slice was decided when it was planned (cont_), so both sides agree on the fade.
-        edge_in_cont_ = cont_;
-        if (next_k_ == k)
-        {
-            cur_ = next_;
-            if (k == 0)
             {
-                // the number of slices may have changed at the cycle start: re-aim the slice number
-                if (!cur_.jumped)
-                    cur_.m = PositionSlice(R_);
-                if (cur_.m > R_ - 1)
-                    cur_.m = R_ - 1;
-                cur_.live = !frozen_ && cur_.m == 0 && cur_.speed == kOne && !cur_.silent;
+                const int32_t i = wrapH(base - (d > 32768 ? Lc[n] : 0));
+                oL[n] = rd(BL, i, xf);
+                oR[n] = rd(BR, i, xf);
             }
-        }
-        else
-        {
-            cur_ = MakeSlice(k, R_, frozen_);
-        }
-        k_ = k;
-        // plan the next slice now, so the current one can fade out if needed
-        next_k_ = (k + 1 < R_) ? k + 1 : 0;
-        next_ = MakeSlice(next_k_, R_, next_k_ == 0 ? p_.freeze : frozen_);
-        cont_ = cur_.live && next_.live;
-    }
-
-    /// Read the normal (slice) path at position s of the current slice.
-    inline void ReadSlice(int32_t s, int32_t &outL, int32_t &outR)
-    {
-        if (cur_.silent)
-        {
-            outL = 0;
-            outR = 0;
-            return;
-        }
-        int32_t idx0, frac;
-        const int32_t S = S_;
-        if (cur_.speed == kOne)
-        {
-            idx0 = cur_.m * S + s;
-            frac = 0;
-        }
-        else
-        {
-            const int32_t sp = cur_.speed < 0 ? -cur_.speed : cur_.speed;
-            int32_t pos = s * sp; // Q8 within the slice
-            const int32_t span = S << 8;
-            while (pos >= span)
-                pos -= span;
-            if (cur_.speed < 0)
-                pos = ((S - 1) << 8) - pos;
-            idx0 = cur_.m * S + (pos >> 8);
-            frac = pos & 0xFF;
-        }
-
-        // idx0 is relative to the cycle start. Was it recorded yet in this cycle?
-        int32_t base = cs_;
-        if (!frozen_)
-        {
-            const int32_t written = Wrap(w_ - cs_); // samples recorded since this cycle started
-            if (idx0 >= written)
+            const uint32_t dr = (sp - u < u) ? sp - u : u;
+            uint32_t ds = (sp - s < s) ? sp - s : s;
+            switch (H[n])
             {
-                // not recorded yet: take it from the previous cycle (one cycle earlier)
-                base = (2 * L_ <= kBufLen) ? cs_ - L_ : cs_;
+            case 1: ds <<= 1; break;
+            case 3: ds = (ds << 1) / 3; break;
+            case 4: ds >>= 1; break;
+            default: break;
             }
+            const uint32_t mm = ds < dr ? ds : dr;
+            win[n] = mm >= fade16 ? 32768 : (int32_t)((mm / (uint32_t)fadeI_) >> 1);
         }
-        const int32_t a = Wrap(base + idx0);
-        const int32_t b = (a + 1 >= kBufLen) ? 0 : a + 1;
-        int32_t l = buf_[0][a];
-        int32_t r = buf_[1][a];
-        if (frac)
-        {
-            l += ((buf_[0][b] - l) * frac) >> 8;
-            r += ((buf_[1][b] - r) * frac) >> 8;
-        }
-        if (!(cur_.live && edge_in_cont_ && cont_))
-        {
-            const bool fin = !(cur_.live && edge_in_cont_);
-            const bool fout = !cont_;
-            const int32_t env = EdgeEnv(s, S, fin, fout);
-            l = (l * env) >> 15;
-            r = (r * env) >> 15;
-        }
-        outL = l;
-        outR = r;
     }
 
-    int16_t *buf_[2] = {nullptr, nullptr};
-    Params p_;
-    int32_t w_ = 0;          ///< write index
-    int32_t t_ = 0;          ///< position in the cycle
-    int32_t L_ = 22000;      ///< cycle length
-    int32_t R_ = 1;          ///< repeats (slices per cycle)
-    int32_t S_ = 22000;      ///< slice length
-    int32_t cs_ = 0;         ///< write index at the cycle start
-    int32_t k_ = 0;          ///< current slice number
-    int32_t next_k_ = 0;
-    Slice cur_, next_;
-    bool edge_in_cont_ = true; ///< the edge into the current slice is continuous (no fade-in)
-    bool cont_ = true;         ///< the edge out of the current slice is continuous (no fade-out)
-    bool frozen_ = false;
-    bool writing_ = true;
-    bool hold_ = false;
-    int32_t hold_start_ = 0, hold_len_ = kMinCycle, hold_pos_ = 0, hold_x_ = 0;
-    int32_t mix_ = 32768;
-    int32_t dmg_acc_ = 0;
-    int32_t dmg_hold_[2] = {0, 0};
-    uint32_t rng_ = 0x9E3779B9u;
-    bool force_boundary_ = false;
-    bool cycle_flag_ = false;
-    bool slice_flag_ = false;
+    int16_t *BL = nullptr, *BR = nullptr;
+    double sr_ = 44000;
+    double prm_[COUNT] = {};
+    double bpm_ = 0, ts_ = 0;
+    Random rng_;
+    uint16_t sinTab_[kTab + 2] = {};
+
+    double giFade = 0, iMaxP = 0, iX = 0, iPre = 0, iMinL = 0, iMaxL = 0;
+    int32_t fadeI_ = 132;
+    double kBoot = 1, kG = 0, kW = 0, kT = 0, kLc = 0, kLe = 0, kNc = 1, kSc = 0, kLnomC = 0, kCarry = 0, kRc = 0,
+           kPassS = 1, kPassC = 1, kFzOn = 0, kFzA = 0, kFzStop = 0, kSpEnd = 0, kFza = 0, kFzG = 0, kFzX = 0,
+           kMc = 0, kMtrC = 0, kJmpC = 0, kRjC = 0, kSpdC = 1, kSilC = 0, kJmpN = 0, kRjN = 0, kSpdN = 1, kSilN = 0,
+           kXP = 1, kXlaw = 0, kTo = 0, kLoE = 0, kLoC = 0, kSo = 0, kMo = 0, kSpdo = 1, kSilo = 0, kOLive = 1,
+           kAo = 0, kao = 0, kXso = 0, kPasso = 1, kSince = 0, kMovT = 0, kTsX = 0;
+    double kTnew2 = 0, kBnd1 = 0, kFzAn = 0, kLnew = 0, kTnew = 0, kHq = 0, kFzNx = 0, kPassEo = 0, kLiveO = 0,
+           kLiveN = 0, kTb = 0, kHp = 0, kE = 0, kR1 = 0, kR2 = 0, kR3 = 0, kR4 = 0, kXs = 0, kWadv = 0;
+    ChangeDetect tsChanged_, fzChanged_;
+    double mixC_ = 0, mixY_ = 0;
+    double timeCached_ = -1, freePer_ = 0.0125, corCached_ = -1, beatsUsed_ = 1;
+    int32_t dsNext_ = 0, dsCount_ = 0, dsStep_ = 65536, dsHeldL_ = 0, dsHeldR_ = 0, qStep8_ = 0;
+    bool cycleFlag_ = false, sliceFlag_ = false;
+
+    // per-block scratch (members: keeps the audio stack small)
+    int32_t xL_[KS], xR_[KS], K_[KS], Tp_[KS], Lp_[KS], Lh_[KS], M_[KS], H_[KS], Ng_[KS], Sil_[KS], Am_[KS], AA_[KS];
+    uint32_t U_[KS], Sp_[KS];
+    int32_t NL_[KS], NR_[KS], NW_[KS], OL_[KS], OR_[KS], OW_[KS], WL_[KS], WR_[KS];
 };
+
+/// The Citadel runs whole 48-sample audio blocks
+using RepeatEngine = RepeatCore<48>;
 
 } // namespace brk

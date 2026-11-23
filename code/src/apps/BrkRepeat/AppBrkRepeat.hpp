@@ -14,6 +14,9 @@
 #include "common/controls/FancyPot.hpp"
 #include "common/dsp/math/qmath.hpp"
 #include "common/EnumTools.hpp"
+#include "common/fastcode.hpp"
+// the engine's per-block code runs from RAM (the Pico SDK puts .time_critical code in RAM)
+#define BRK_FAST __attribute__((section(".time_critical.brk_repeat"))) __attribute__((noinline))
 #include "apps/BrkRepeat/RepeatEngine.hpp"
 
 namespace kastle2
@@ -42,7 +45,7 @@ private:
         WONK,     // POT_2 (SAMPLE MOD)
         DAMAGE,   // SHIFT + POT_2
         MIX,      // SHIFT + POT_4
-        SYNC,     // SHIFT + POT_6: left half = synced to the clock, right half = free time
+        CLOCK,    // SHIFT + POT_6: FREE | 1 | 2 | 4 | 24 clock pulses per beat
         COUNT
     };
 
@@ -53,30 +56,46 @@ private:
     static constexpr Hardware::AnalogInput CV_BRAEK = Hardware::AnalogInput::PARAM_1;    // SAMPLE CV
     static constexpr Hardware::AnalogInput CV_WONK = Hardware::AnalogInput::MODE;        // BANK CV
 
-    /// Synced cycle lengths in quarter-note beats, Q8 (256 = one beat): 1/32 note .. 2 bars
-    static constexpr int32_t kSyncBeatsQ8[] = {32, 64, 128, 256, 512, 1024, 2048};
-    static constexpr int32_t kSyncSteps = 7;
+    /// SHIFT + SAMPLE zones: 0 = FREE time, then clock pulses per beat
+    static constexpr int32_t kClockZones = 5;
+    static constexpr int32_t kPulsesPerBeat[kClockZones] = {0, 1, 2, 4, 24};
+
+    using Engine = brk::RepeatEngine;
+    static constexpr int KS = 48;
+    static_assert(AUDIO_BUFFER_SIZE == KS, "the engine runs one block per audio loop");
 
     int32_t PotWithCv(Pot pot, Hardware::AnalogInput cv, bool pitch_input);
-    int32_t ComputeCycleLength(int32_t time, bool synced, int32_t &beats_q8);
+    static double Unit(int32_t v) { return static_cast<double>(v) / static_cast<double>(POT_MAX); }
+    void ClockTick();
 
     bool inited_ = false;
     EnumArray<Pot, std::unique_ptr<FancyPot>> pots_;
-    brk::RepeatEngine engine_;
-    brk::RepeatEngine::Params params_;
+    Engine engine_;
+    double free_time_max_ = 1.0; ///< TIME value (engine units) of the longest free cycle
 
-    // UI state
+    // buttons
     bool freeze_toggle_ = false;
     bool mode_was_pressed_ = false;
     bool mode_used_with_shift_ = false;
-    int32_t beat_count_ = 0;
-    int32_t cycle_beats_q8_ = 256;
-    bool synced_ = true;
+    bool hold_engaged_ = false;
+
+    // clock -> tempo and song position (as the ER-301 unit does it, in whole audio blocks)
+    int32_t pulses_per_beat_ = 1;
+    uint32_t pulse_count_ = 0;
+    bool have_beat_ = false;
+    double beats_ = 0;
+    double samples_since_beat_ = 0;
+    double beat_period_ = 0; ///< samples per beat, 0 = not known yet
+
+    // deinterleaved audio
+    int32_t in_l_[KS], in_r_[KS], out_l_[KS], out_r_[KS];
 
     // shown by the UI loop (set in the audio loop)
     volatile uint32_t cycle_blink_ = 0;
     volatile uint32_t slice_blink_ = 0;
-    volatile uint8_t state_ = 0;
+    volatile uint32_t beat_blink_ = 0;
+    volatile uint8_t state_ = 0; // 0 live, 1 repeating, 2 frozen, 3 hold
+    volatile bool synced_ = true;
 };
 
 } // namespace kastle2

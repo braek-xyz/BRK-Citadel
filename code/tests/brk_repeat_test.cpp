@@ -1,244 +1,282 @@
 // Host tests for the BRK Repeat engine (runs on a normal computer, not the Citadel).
-// Build: g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I code/src code/tests/brk_repeat_test.cpp -o /tmp/brt && /tmp/brt
+// Build (from the repository root):
+//   g++ -std=c++20 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I code/src -I code/tests/er301_reference
+//       code/tests/brk_repeat_test.cpp code/tests/er301_reference/RefWrap.cpp -o brk_repeat_test && ./brk_repeat_test
+// Prints "N checks, 0 failed" and exits 0 when everything passed.
+//
+// The main checks run the Citadel engine (fixed point) next to the ER-301 engine (doubles, BRK-ER301 dsp/, copied
+// into code/tests/er301_reference) on the same input and controls, and compare the outputs sample by sample.
 #include "apps/BrkRepeat/RepeatEngine.hpp"
+#include "RefWrap.hpp"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cmath>
+#include <functional>
 #include <vector>
 
-using brk::RepeatEngine;
 static int checks = 0, failed = 0;
-#define CHECK(c, msg)                                   \
-    do                                                  \
-    {                                                   \
-        checks++;                                       \
-        if (!(c))                                       \
-        {                                               \
-            failed++;                                   \
-            std::printf("FAIL: %s (line %d)\n", msg, __LINE__); \
-        }                                               \
-    } while (0)
-
-static int16_t bufL[RepeatEngine::kBufLen], bufR[RepeatEngine::kBufLen];
-static const size_t kBlock = 48;
-
-// deterministic test signal: a ramp-ish signal that is different at every sample
-static int16_t sig(int64_t n, int ch) { return static_cast<int16_t>(((n * 37 + ch * 1000) % 20000) - 10000); }
-
-static void run(RepeatEngine &e, const RepeatEngine::Params &p, int64_t &n, size_t blocks,
-                std::vector<int16_t> *outL = nullptr, std::vector<int16_t> *inL = nullptr)
+static void check(bool ok, const char *what)
 {
-    int16_t in[2 * kBlock], out[2 * kBlock];
-    for (size_t b = 0; b < blocks; b++)
+    checks++;
+    if (!ok)
+        failed++;
+    std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what);
+}
+
+static const double SR = 44000;
+using Core32 = brk::RepeatCore<32>;
+using Core48 = brk::RepeatCore<48>;
+enum
+{
+    MIX = Core32::MIX, TIME = Core32::TIME, REPEATS = Core32::REPEATS, POSITION = Core32::POSITION,
+    BRAEK = Core32::BRAEK, WONK = Core32::WONK, DAMAGE = Core32::DAMAGE, SYNC = Core32::SYNC,
+    FREEZE = Core32::FREEZE, FREEZEHOLD = Core32::FREEZEHOLD, HOLD = Core32::HOLD
+};
+
+static int16_t gL[Core32::kBufferLen], gR[Core32::kBufferLen];
+
+// test input: drum-like bursts (decaying noise + tone) every 0.3 s, plus a quiet sine, different per channel
+struct Sig
+{
+    uint32_t rnd = 12345;
+    int64_t n = 0;
+    double next(int ch)
     {
-        for (size_t i = 0; i < kBlock; i++)
-        {
-            in[2 * i] = sig(n + i, 0);
-            in[2 * i + 1] = sig(n + i, 1);
-        }
-        e.SetParams(p);
-        e.Process(in, out, kBlock);
-        for (size_t i = 0; i < kBlock; i++)
-        {
-            if (outL)
-                outL->push_back(out[2 * i]);
-            if (inL)
-                inL->push_back(in[2 * i]);
-        }
-        n += kBlock;
+        rnd = rnd * 1664525u + 1013904223u;
+        const double noise = ((rnd >> 8) / 8388608.0 - 1.0);
+        const double t = std::fmod(n / SR, 0.3);
+        const double env = std::exp(-t * 18);
+        const double tone = std::sin(2 * M_PI * (ch ? 180 : 120) * n / SR);
+        return 0.45 * env * (0.6 * noise + 0.8 * tone) + 0.05 * std::sin(2 * M_PI * 440 * n / SR + ch);
     }
+};
+
+struct Stats
+{
+    double errSq = 0, refSq = 0, maxErr = 0;
+    long big = 0, total = 0;
+    double rel() const { return refSq > 0 ? std::sqrt(errSq / refSq) : std::sqrt(errSq); }
+    double bigFrac() const { return total ? (double)big / total : 0; }
+};
+
+template <class Core> constexpr int blockOf();
+template <> constexpr int blockOf<Core32>() { return 32; }
+template <> constexpr int blockOf<Core48>() { return 48; }
+
+// Runs both engines for 'seconds'; 'ctl' sets the controls of both before each 96-sample stretch
+// (96 = a whole number of 32- and 48-sample blocks, so both engines see every change at the same sample).
+template <class Core>
+static Stats compare(double seconds, const std::function<void(double t, std::function<void(int, double)>)> &ctl,
+                     double bpm = 0, double *wetRms = nullptr)
+{
+    static Core c;
+    c.Init(gL, gR, SR);
+    RefEngine ref(SR);
+    Sig sig;
+    Stats st;
+    const int N = 96;
+    const long total = (long)(seconds * SR / N);
+    double ts = 0, wetSq = 0;
+    for (long b = 0; b < total; b++)
+    {
+        const double t = (double)b * N / SR;
+        ctl(t, [&](int id, double v) { c.SetParam(id, v); ref.setParam(id, v); });
+        double iL[N], iR[N], rL[N], rR[N];
+        int32_t qL[N], qR[N], oL[N], oR[N];
+        for (int n = 0; n < N; n++)
+        {
+            iL[n] = sig.next(0);
+            iR[n] = sig.next(1);
+            sig.n++;
+            qL[n] = (int32_t)std::lround(iL[n] * 32768);
+            qR[n] = (int32_t)std::lround(iR[n] * 32768);
+            // feed the reference exactly the 16-bit input the Citadel engine gets
+            iL[n] = qL[n] / 32768.0;
+            iR[n] = qR[n] / 32768.0;
+        }
+        for (int k = 0; k < N; k += RefEngine::KS)
+        {
+            ref.setTransport(bpm, ts + (double)k / SR);
+            ref.process(iL + k, iR + k, rL + k, rR + k);
+        }
+        for (int k = 0; k < N; k += blockOf<Core>())
+        {
+            c.SetTransport(bpm, ts + (double)k / SR);
+            c.ProcessBlock(qL + k, qR + k, oL + k, oR + k);
+        }
+        ts += (double)N / SR;
+        if (t < 0.05)
+            continue; // start-up
+        for (int n = 0; n < N; n++)
+        {
+            for (int ch = 0; ch < 2; ch++)
+            {
+                const double r = ch ? rR[n] : rL[n];
+                const double o = (ch ? oR[n] : oL[n]) / 32768.0;
+                const double e = std::fabs(o - r);
+                st.errSq += e * e;
+                st.refSq += r * r;
+                wetSq += o * o;
+                if (e > st.maxErr)
+                    st.maxErr = e;
+                if (e > 0.01)
+                    st.big++;
+                st.total++;
+            }
+        }
+    }
+    if (wetRms)
+        *wetRms = std::sqrt(wetSq / (st.total ? st.total : 1));
+    return st;
+}
+
+static void report(const char *name, const Stats &s, double relMax = 0.02, double bigMax = 0.002)
+{
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "%s: error %.4f%% of signal (%.1f dB), %.3f%% samples off by > -40 dB, max %.4f",
+                  name, 100 * s.rel(), 20 * std::log10(s.rel() + 1e-12), 100 * s.bigFrac(), s.maxErr);
+    check(s.rel() < relMax && s.bigFrac() < bigMax, buf);
 }
 
 int main()
 {
-    // 1. Repeats 1, nothing else: output is exactly the input
+    using F = std::function<void(int, double)>;
+
+    // 1. MIX 0: the input passes through exactly
     {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        p.cycle_len = 11000;
-        int64_t n = 0;
-        std::vector<int16_t> o, i;
-        run(e, p, n, 3000, &o, &i);
-        size_t diff = 0;
-        for (size_t k = 0; k < o.size(); k++)
-            diff += (o[k] != i[k]);
-        CHECK(diff == 0, "repeats 1 passes the input unchanged");
-    }
-    // 2. Repeats 4, position 0: every slice of a cycle repeats slice 0 (away from the fades)
-    {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        p.cycle_len = 4800; // 100 blocks
-        p.repeats = 4;      // slice = 1200
-        int64_t n = 0;
-        std::vector<int16_t> o, i;
-        run(e, p, n, 1000, &o, &i);
-        // the first cycle start after sample 0 is at 4800 (initial cycle is 22000 -> first boundary at 22000)
-        const size_t c0 = 22000;
-        bool ok = true;
-        for (int c = 0; c < 5; c++)
-            for (int k = 1; k < 4; k++)
-                for (int s = 200; s < 1000; s++)
-                {
-                    size_t at = c0 + c * 4800 + k * 1200 + s;
-                    size_t src = c0 + c * 4800 + s;
-                    if (o[at] != i[src])
-                        ok = false;
-                }
-        CHECK(ok, "repeats 4 / position 0 repeats the first slice");
-        bool ok0 = true;
-        for (int c = 1; c < 5; c++)
-            for (int s = 200; s < 1000; s++)
-                if (o[c0 + c * 4800 + s] != i[c0 + c * 4800 + s])
-                    ok0 = false;
-        CHECK(ok0, "slice 0 is the live sound");
-    }
-    // 3. Position last slice: slice 0 must come from the previous cycle (already recorded)
-    {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        p.cycle_len = 4800;
-        p.repeats = 4;
-        p.position = 4095;
-        int64_t n = 0;
-        std::vector<int16_t> o, i;
-        run(e, p, n, 1000, &o, &i);
-        const size_t c0 = 22000;
-        bool ok = true;
-        for (int c = 2; c < 5; c++)
-            for (int s = 200; s < 1000; s++)
-            {
-                size_t at = c0 + c * 4800 + s;               // slice 0 of cycle c
-                size_t src = c0 + (c - 1) * 4800 + 3600 + s; // slice 3 of cycle c-1
-                if (o[at] != i[src])
-                    ok = false;
-            }
-        CHECK(ok, "not-yet-recorded slice is read from the previous cycle");
-    }
-    // 4. FREEZE: after it engages, the output repeats with the cycle length
-    {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        p.cycle_len = 4800;
-        int64_t n = 0;
-        run(e, p, n, 500);
-        p.freeze = true;
-        std::vector<int16_t> o;
-        run(e, p, n, 1000, &o);
-        CHECK(e.GetState() == RepeatEngine::State::FROZEN, "freeze engages");
-        bool ok = true;
-        for (size_t k = 20000; k + 4800 < o.size(); k++)
-            if (o[k] != o[k + 4800])
-                ok = false;
-        CHECK(ok, "frozen output loops with the cycle length");
-        p.freeze = false;
-        std::vector<int16_t> o2, i2;
-        run(e, p, n, 500, &o2, &i2);
-        CHECK(e.GetState() == RepeatEngine::State::LIVE, "freeze releases");
-        bool live = true;
-        for (size_t k = 12000; k < o2.size(); k++)
-            if (o2[k] != i2[k])
-                live = false;
-        CHECK(live, "after release the sound is live again");
-    }
-    // 5. HOLD: output loops with the slice length
-    {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        p.cycle_len = 9600;
-        p.repeats = 8; // slice 1200
-        int64_t n = 0;
-        run(e, p, n, 1000);
-        p.hold = true;
-        std::vector<int16_t> o;
-        run(e, p, n, 300, &o);
-        CHECK(e.GetState() == RepeatEngine::State::HOLD, "hold engages");
-        bool ok = true;
-        for (size_t k = 2000; k + 1200 < o.size(); k++)
-            if (o[k] != o[k + 1200])
-                ok = false;
-        CHECK(ok, "held output loops with the slice length");
-    }
-    // 6. Fuzz: random settings, clock realigns, freeze / hold switching. Sanitizers catch out-of-range access.
-    {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        int64_t n = 0;
-        srand(1);
-        int16_t in[2 * kBlock], out[2 * kBlock];
-        int32_t peak = 0;
-        for (int b = 0; b < 200000; b++)
+        static Core48 c;
+        c.Init(gL, gR, SR);
+        Sig sig;
+        bool same = true;
+        for (int b = 0; b < 4000; b++)
         {
-            if (b % 97 == 0)
+            int32_t L[48], R[48], oL[48], oR[48];
+            for (int n = 0; n < 48; n++)
             {
-                p.cycle_len = rand() % 70000;
-                p.repeats = rand() % 18;
-                p.position = rand() % 4096;
-                p.braek = rand() % 4096;
-                p.wonk = rand() % 4096;
-                p.damage = rand() % 4096;
-                p.mix = rand() % 32768;
+                L[n] = (int32_t)std::lround(sig.next(0) * 32768);
+                R[n] = (int32_t)std::lround(sig.next(1) * 32768);
+                sig.n++;
             }
-            if (b % 53 == 0)
-                p.freeze = rand() % 2;
-            if (b % 31 == 0)
-                p.hold = (rand() % 5) == 0;
-            if (b % 41 == 0)
-                e.Realign();
-            for (size_t i = 0; i < kBlock; i++)
-            {
-                in[2 * i] = (rand() % 65536) - 32768;
-                in[2 * i + 1] = (rand() % 65536) - 32768;
-            }
-            e.SetParams(p);
-            e.Process(in, out, kBlock);
-            for (size_t i = 0; i < 2 * kBlock; i++)
-                peak = std::max<int32_t>(peak, std::abs(out[i]));
-            n += kBlock;
+            c.SetParam(MIX, 0);
+            c.SetParam(REPEATS, 8);
+            c.ProcessBlock(L, R, oL, oR);
+            for (int n = 0; n < 48; n++)
+                same = same && oL[n] == L[n] && oR[n] == R[n];
         }
-        CHECK(peak <= 32768, "fuzz: output stays in range");
+        check(same, "MIX 0 passes the input through unchanged");
     }
-    // 7. Clicks: with repeats 4 and wonk / braek, a quiet sine must not get jumps bigger than a few steps
+
+    // 2. same sound as the ER-301 engine (blocks of 32, as on the ER-301)
+    auto basic = [](double, F s) { s(MIX, 1); s(TIME, 0.5); s(REPEATS, 4); s(POSITION, 0.34); };
+    report("free 4 repeats", compare<Core32>(4, basic));
+    report("one repeat (passes input)", compare<Core32>(3, [](double, F s) { s(MIX, 1); s(TIME, 0.3); }));
+    report("16 repeats, short", compare<Core32>(3, [](double, F s) { s(MIX, 1); s(TIME, 0.12); s(REPEATS, 16); s(POSITION, 0.7); }));
+    report("BRAEK + WONK", compare<Core32>(6, [](double, F s) {
+               s(MIX, 1); s(TIME, 0.55); s(REPEATS, 6); s(POSITION, 0.2); s(BRAEK, 0.5); s(WONK, 0.8); }));
+    report("WONK only (speeds and reverse)", compare<Core32>(6, [](double, F s) {
+               s(MIX, 1); s(TIME, 0.6); s(REPEATS, 3); s(WONK, 1); }));
+    report("SYNC 110 bpm, 1/8 notes", compare<Core32>(6, [](double, F s) {
+               s(MIX, 1); s(SYNC, 1); s(TIME, 0.15); s(REPEATS, 2); s(POSITION, 1); }, 110));
+    report("SYNC 110 bpm, 1/4 note, 8 repeats, WONK", compare<Core32>(6, [](double, F s) {
+               s(MIX, 1); s(SYNC, 1); s(TIME, 0.35); s(REPEATS, 8); s(WONK, 0.5); s(BRAEK, 0.3); }, 110));
+    report("FREEZE on, then off", compare<Core32>(6, [](double t, F s) {
+               s(MIX, 1); s(TIME, 0.5); s(REPEATS, 2); s(FREEZE, (t > 1.0 && t < 3.5) ? 1 : 0); }));
+    report("HOLD presses", compare<Core32>(6, [](double t, F s) {
+               s(MIX, 0.8); s(TIME, 0.45); s(REPEATS, 4); s(HOLD, 1);
+               double ph = std::fmod(t, 1.0);
+               s(FREEZEHOLD, ph > 0.4 && ph < 0.75 ? 1 : 0); }));
+    report("knobs moving (TIME, REPEATS, POSITION)", compare<Core32>(8, [](double t, F s) {
+               s(MIX, 1); s(TIME, 0.3 + 0.3 * std::sin(t * 0.7)); s(REPEATS, 1 + std::floor(8 * (0.5 + 0.5 * std::sin(t * 1.3))));
+               s(POSITION, 0.5 + 0.5 * std::sin(t * 0.4)); s(BRAEK, t > 4 ? 0.4 : 0); }));
+    report("DAMAGE 0.5", compare<Core32>(4, [](double, F s) {
+               s(MIX, 1); s(TIME, 0.5); s(REPEATS, 4); s(DAMAGE, 0.5); }));
+    // other DAMAGE settings hold a sample for a fractional count; where that count lands exactly on a whole sample the
+    // two engines can round it to neighbouring samples, so only the overall sound is compared
+    report("DAMAGE 0.6 (overall)", compare<Core32>(4, [](double, F s) {
+               s(MIX, 1); s(TIME, 0.5); s(REPEATS, 4); s(DAMAGE, 0.6); }), 0.1, 0.02);
+    report("MIX half, FREEZE with MIX 0", compare<Core32>(5, [](double t, F s) {
+               s(MIX, t < 2 ? 0.5 : 0); s(TIME, 0.4); s(REPEATS, 3); s(FREEZE, t > 2.5 ? 1 : 0); }));
+
+    // 3. the Citadel's 48-sample blocks give the same sound as 32 (steady controls)
+    report("48-sample blocks: free 4 repeats", compare<Core48>(4, basic));
+    report("48-sample blocks: SYNC + WONK", compare<Core48>(6, [](double, F s) {
+               s(MIX, 1); s(SYNC, 1); s(TIME, 0.35); s(REPEATS, 8); s(WONK, 0.5); s(BRAEK, 0.3); }, 110));
+    report("48-sample blocks: FREEZE", compare<Core48>(6, [](double t, F s) {
+               s(MIX, 1); s(TIME, 0.5); s(REPEATS, 2); s(FREEZE, (t > 1.0 && t < 3.5) ? 1 : 0); }), 0.05, 0.01);
+
+    // 4. SYNC notes longer than the memory are halved and stay on the beat
     {
-        RepeatEngine e;
-        e.Init(bufL, bufR);
-        RepeatEngine::Params p;
-        p.cycle_len = 8800;
-        p.repeats = 4;
-        p.position = 1500;
-        p.braek = 1500;
-        p.wonk = 2000;
-        int16_t in[2 * kBlock], out[2 * kBlock];
-        int64_t n = 0;
-        int32_t prev = 0, worst = 0;
-        for (int b = 0; b < 20000; b++)
+        static Core48 c;
+        c.Init(gL, gR, SR);
+        c.SetParam(SYNC, 1);
+        c.SetParam(TIME, 0.95); // 2 bars
+        c.SetParam(MIX, 1);
+        int32_t z[48] = {}, o[48], o2[48];
+        double ts = 0;
+        int cycles = 0;
+        long lastCycle = -1, len = 0;
+        for (long b = 0; b < 6000; b++)
         {
-            for (size_t i = 0; i < kBlock; i++)
+            c.SetTransport(110, ts);
+            c.ProcessBlock(z, z, o, o2);
+            ts += 48 / SR;
+            if (c.TakeCycleFlag())
             {
-                int16_t v = static_cast<int16_t>(8000 * std::sin(2 * M_PI * 110.0 * (n + i) / 44000.0));
-                in[2 * i] = v;
-                in[2 * i + 1] = v;
+                if (lastCycle >= 0)
+                    len = (b - lastCycle) * 48;
+                lastCycle = b;
+                cycles++;
             }
-            e.SetParams(p);
-            e.Process(in, out, kBlock);
-            for (size_t i = 0; i < kBlock; i++)
-            {
-                if (b > 500)
-                    worst = std::max(worst, std::abs(out[2 * i] - prev));
-                prev = out[2 * i];
-            }
-            n += kBlock;
         }
-        // a 110 Hz sine at 8000 moves at most about 126 per sample; at double speed about 252
-        std::printf("largest sample-to-sample step: %d\n", worst);
-        CHECK(worst < 600, "no clicks at slice edges");
+        // 110 bpm: one beat = 24000 samples; the longest cycle is about 24700, so 2 bars -> 1 beat
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "SYNC 2 bars at 110 bpm halves to %.3g beats (cycle about %ld samples, max %.0f)",
+                      c.SyncBeats(), len, c.MaxCycleSeconds() * SR);
+        check(c.SyncBeats() == 1.0 && cycles > 5 && std::labs(len - 24000) <= 48, buf);
+        c.SetTransport(60, ts);
+        c.ProcessBlock(z, z, o, o2);
+        check(c.SyncBeats() == 0.5, "SYNC 2 bars at 60 bpm halves to 1/8 note");
     }
+
+    // 5. fuzz: random controls, loud input; must stay in range (sanitizers watch the memory)
+    {
+        static Core48 c;
+        c.Init(gL, gR, SR);
+        uint32_t r = 777;
+        auto rnd = [&]() { r = r * 1664525u + 1013904223u; return (r >> 8) / 16777216.0; };
+        bool ok = true;
+        double ts = 0;
+        for (long b = 0; b < 40000; b++)
+        {
+            if (b % 37 == 0)
+            {
+                c.SetParam(MIX, rnd());
+                c.SetParam(TIME, rnd());
+                c.SetParam(REPEATS, 1 + 15 * rnd());
+                c.SetParam(POSITION, rnd());
+                c.SetParam(BRAEK, rnd());
+                c.SetParam(WONK, rnd());
+                c.SetParam(DAMAGE, rnd());
+                c.SetParam(SYNC, rnd() > 0.5);
+                c.SetParam(FREEZE, rnd() > 0.7);
+                c.SetParam(HOLD, rnd() > 0.6);
+                c.SetParam(FREEZEHOLD, rnd() > 0.5);
+            }
+            int32_t L[48], R[48], oL[48], oR[48];
+            for (int n = 0; n < 48; n++)
+            {
+                L[n] = (int32_t)(rnd() * 80000 - 40000); // beyond 16 bits on purpose
+                R[n] = -L[n];
+            }
+            c.SetTransport(b % 5000 < 4000 ? 40 + 300 * rnd() * (b % 3 == 0) + 100 : 0, ts);
+            ts += 48 / SR;
+            c.ProcessBlock(L, R, oL, oR);
+            for (int n = 0; n < 48; n++)
+                ok = ok && oL[n] >= -32768 && oL[n] <= 32767 && oR[n] >= -32768 && oR[n] <= 32767;
+        }
+        check(ok, "fuzz: 40000 blocks of random controls, output stays in range");
+    }
+
     std::printf("%d checks, %d failed\n", checks, failed);
     return failed ? 1 : 0;
 }
