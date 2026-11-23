@@ -11,6 +11,9 @@ crunch (DAMAGE), or freeze a loop. Same idea as the REPEAT effect in LAZERS.
 2. Power off, connect the Citadel by USB-C, hold **SHIFT** while powering on: it appears as a USB drive.
 3. Drag **`kastle2-brk-repeat.uf2`** onto the drive. It restarts on its own.
 
+**No sound?** Hold SHIFT and turn PITCH MOD up (input level), and SHIFT + PITCH (output level). Coming from
+Wave Bard these may be turned down. Then set SAMPLE, PITCH MOD and SAMPLE MOD fully left: you should hear the input unchanged.
+
 To go back: the same steps with Bastl's official Wave Bard or FX Wizard file. Your Wave Bard samples are stored
 separately and are not touched, but Wave Bard settings may reset when you switch firmware.
 

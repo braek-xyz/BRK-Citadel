@@ -15,7 +15,8 @@ Not tested: nothing on a Citadel yet. CPU load, knob feel, clock sync, CV ranges
 
 Hardware test 1 (BRAEK, 0.1): LEDs run (LED 2 white cycle flashes) but no sound heard; LED 1 flashed red =
 HOLD switching on by itself. Cause found: TRIG in is normalled to an internal gate on the Citadel. 0.2 removes
-TRIG -> HOLD and RESET -> FREEZE. Still open: confirm audio IN was patched, and whether stock FX Wizard passes sound.
+TRIG -> HOLD and RESET -> FREEZE. Hardware test 2 (0.2): silence was the Citadel's stored INPUT level (SHIFT + PITCH MOD), left low from Wave Bard use.
+After raising it, levels OK. Manual should tell users to check SHIFT + PITCH MOD / SHIFT + PITCH first.
 
 Next:
 1. BRAEK flashes `kastle2-brk-repeat.uf2` and reports: does it pass audio, do REPEATS / TIME / HOLD / FREEZE work,
