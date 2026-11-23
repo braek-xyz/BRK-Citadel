@@ -25,7 +25,9 @@ Citadel (Eurorack Kastle 2; same firmware files). Read `docs/RESUME_HERE.md` fir
 
 ## Build (cloud / Linux)
 Arm GCC 14.2.1+ (xPack, see `.github/workflows/build.yml`) and Pico SDK 2.1.1 (`PICO_SDK_PATH`), then
-`cmake -S code -B code/build && cmake --build code/build --target fx-wizard template`. Output: `code/build/output/*.uf2`.
+`cmake -S code -B code/build && cmake --build code/build --target brk-repeat fx-wizard`. Output: `code/build/output/*.uf2`.
+Engine tests (host): `g++ -std=c++20 -fsanitize=address,undefined -I code/src -I code/tests/er301_reference code/tests/brk_repeat_test.cpp code/tests/er301_reference/RefWrap.cpp` (prints "N checks, 0 failed"; compares with the ER-301 engine).
+Engine: `code/src/apps/BrkRepeat/RepeatEngine.hpp` (plain C++, port of the ER-301 / LAZERS REPEAT engine; keep it matching `code/tests/er301_reference`); Citadel wrapper: `AppBrkRepeat.cpp`. Manual: `docs/BRK-REPEAT.md`.
 
 ## BRAEK's standing habits (do these without being asked)
 - End of every session: ask "Shall I update `docs/RESUME_HERE.md` now? (recommended: yes)".

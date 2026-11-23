@@ -10,6 +10,11 @@ RP2040 (2 cores, 176 MHz, 264 kB RAM, no FPU), 8 MB flash, 44.1 kHz / 16-bit ste
 clock in / out, gates, CV ins (0-5 V), 3 CV outs, USB MIDI. Code: Pico SDK + C++ (Bastl's Kastle 2 framework, MIT).
 Limit: about 1.2 s stereo / 2.4 s mono of audio memory (LAZERS REPEAT allows 4 s).
 
+## Status
+- Phase 0 done (2026-11-23). Phase 1 + 2 built as BRK Repeat 0.1, waiting for BRAEK's hardware test.
+- The Phase 1 repeater is a textbook ring-buffer slicer (no new DSP), so no `dsp-research` run was needed yet;
+  use it for Phase 3 ideas.
+
 ## Phases
 0. Setup: fork, cloud build, BRAEK flashes stock FX Wizard from our build (proves build and the way back).
 1. First playable repeater: clock-synced buffer, TIME, REPEATS, POSITION, MIX, HOLD, click-free crossfades.

@@ -29,13 +29,18 @@ jobs:
           git -C "$HOME/pico-sdk" submodule update --init --depth 1 lib/tinyusb
           echo "PICO_SDK_PATH=$HOME/pico-sdk" >> "$GITHUB_ENV"
 
+      - name: Test the repeater engine (on the build computer)
+        run: |
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I code/src -I code/tests/er301_reference code/tests/brk_repeat_test.cpp code/tests/er301_reference/RefWrap.cpp -o brk_repeat_test
+          ./brk_repeat_test
+
       - name: Build
         run: |
           arm-none-eabi-gcc --version | head -1
           cmake -S code -B code/build -DCMAKE_BUILD_TYPE=Debug
-          # Bastl's own firmwares (stock, unchanged) prove the build chain.
+          # BRK Repeat (ours) + Bastl's stock FX Wizard (unchanged, a known-good file for comparison).
           # wave-bard-with-samples is never built: Bastl's samples are "all rights reserved".
-          cmake --build code/build -j 4 --target fx-wizard template
+          cmake --build code/build -j 4 --target brk-repeat fx-wizard
           ls -la code/build/output/*.uf2
 
       - name: Upload firmware files
