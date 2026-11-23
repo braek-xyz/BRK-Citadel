@@ -7,7 +7,7 @@
  * Controls (Wave Bard panel names in brackets):
  *   TIME [PITCH], REPEATS [SAMPLE], POSITION [LENGTH], BRAEK [PITCH MOD], WONK [SAMPLE MOD]
  *   SHIFT + [SAMPLE MOD] = DAMAGE, SHIFT + [LENGTH] = MIX,
- *   SHIFT + [SAMPLE] = CLOCK: FREE time, or synced with 1, 2, 4 or 24 clock pulses per beat
+ *   SHIFT + [SAMPLE] = SYNC (left half, TIME in steps of the incoming clock) / FREE (right half)
  *   MODE button held = HOLD; SHIFT + tap MODE = FREEZE on / off
  *   LFO, tempo, input / output level and the clock input work as in Bastl's firmwares.
  */
@@ -53,23 +53,23 @@ void AppBrkRepeat::Init()
     pots_[Pot::MIX] = FancyPot::Create({.pot = Hardware::Pot::POT_4,
                                         .layer = Hardware::Layer::SHIFT,
                                         .initial_value = POT_MAX});
-    // default: synced, one clock pulse per beat (a 1/4-note clock)
-    pots_[Pot::CLOCK] = FancyPot::Create({.pot = Hardware::Pot::POT_6,
-                                          .layer = Hardware::Layer::SHIFT,
-                                          .initial_value = (POT_MAX * 3) / (2 * kClockZones)});
+    pots_[Pot::SYNC] = FancyPot::Create({.pot = Hardware::Pot::POT_6,
+                                         .layer = Hardware::Layer::SHIFT,
+                                         .initial_value = POT_MIN});
     for (auto &pot : pots_)
     {
         pot->Init(AUDIO_LOOP_RATE);
     }
 
     engine_.Init(g_buf_left, g_buf_right, static_cast<double>(SAMPLE_RATE));
+    engine_.SetSyncTable(kSyncPulses, kSyncSteps);
+    engine_.SetTempoRange(15.0, 30000.0); // pulses a minute: 3 s .. 2 ms apart, as ClockTick() accepts
     // free TIME: the whole knob sweeps 12.5 ms .. the longest cycle (engine TIME is 12.5 ms x 320^time)
     free_time_max_ = std::log(engine_.MaxCycleSeconds() / 0.0125) / std::log(320.0);
     freeze_toggle_ = false;
     mode_was_pressed_ = false;
     mode_used_with_shift_ = false;
     hold_engaged_ = false;
-    pulse_count_ = 0;
     have_beat_ = false;
     beats_ = 0;
     samples_since_beat_ = 0;
@@ -94,37 +94,33 @@ int32_t AppBrkRepeat::PotWithCv(Pot pot, Hardware::AnalogInput cv, bool pitch_in
     return constrain(v + c, POT_MIN, POT_MAX);
 }
 
-// One audio loop of the clock: pulses -> beats (every pulses_per_beat_ pulses), the beat length in samples and the
-// song position.  Same idea as the ER-301 unit: the position moves on smoothly between beats, but never past the next
-// beat, so if the clock stops the position stops too (and after 0.25 s SYNC runs on at the last tempo).
+// One audio loop of the clock: every incoming pulse is one "beat" for the engine.  It measures the time between
+// pulses and keeps a song position, as the ER-301 unit does: the position moves on smoothly between pulses but never
+// past the next one, so if the clock stops the position stops too (and after 0.25 s SYNC runs on at the last tempo).
 void AppBrkRepeat::ClockTick()
 {
     Clock &clock = Kastle2::base.GetClock();
     if (clock.IsNowReset())
     {
-        pulse_count_ = 0;
         have_beat_ = false;
         beats_ = 0;
         samples_since_beat_ = 0;
     }
     if (clock.IsNowTrigger())
     {
-        if (pulse_count_ % static_cast<uint32_t>(pulses_per_beat_) == 0)
+        if (have_beat_)
         {
-            if (have_beat_)
+            // 2 ms .. 3 s between pulses
+            const double lo = SAMPLE_RATE * 0.002, hi = SAMPLE_RATE * 3.0;
+            if (samples_since_beat_ >= lo && samples_since_beat_ <= hi)
             {
-                const double lo = SAMPLE_RATE * 60.0 / 400.0, hi = SAMPLE_RATE * 60.0 / 20.0;
-                if (samples_since_beat_ >= lo && samples_since_beat_ <= hi)
-                {
-                    beat_period_ = samples_since_beat_;
-                }
-                beats_ += 1;
+                beat_period_ = samples_since_beat_;
             }
-            have_beat_ = true;
-            samples_since_beat_ = 0;
-            beat_blink_ = 12;
+            beats_ += 1;
         }
-        pulse_count_++;
+        have_beat_ = true;
+        samples_since_beat_ = 0;
+        beat_blink_ = 12;
     }
 }
 
@@ -141,14 +137,7 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
     }
 
     // ---- clock ----
-    const int32_t zone = constrain((pots_[Pot::CLOCK]->GetValue() * kClockZones) / (POT_MAX + 1), 0, kClockZones - 1);
-    synced_ = zone > 0;
-    if (synced_ && kPulsesPerBeat[zone] != pulses_per_beat_)
-    {
-        pulses_per_beat_ = kPulsesPerBeat[zone];
-        pulse_count_ = 0;
-        have_beat_ = false;
-    }
+    synced_ = pots_[Pot::SYNC]->GetValue() < POT_HALF;
     ClockTick();
     double bpm = 0, song_pos = 0;
     if (beat_period_ > 0)
@@ -167,9 +156,9 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
     const int32_t time = PotWithCv(Pot::TIME, CV_TIME, true);
     if (synced_)
     {
-        // ten note lengths: 1/16, 1/8, 1/8., 1/4, 1/4., 1/2, 1/2., 1 bar, 1.5 bars, 2 bars (halved if too long)
-        const int32_t note = constrain((time * 10) / (POT_MAX + 1), 0, 9);
-        engine_.SetParam(Engine::TIME, (note + 0.5) / 10.0);
+        // eleven steps of the clock pulse: 1/8, 1/4, 1/3, 1/2, 2/3, 1 (middle), 3/2, 2, 3, 4, 8 pulses
+        const int32_t step = constrain((time * kSyncSteps) / (POT_MAX + 1), 0, kSyncSteps - 1);
+        engine_.SetParam(Engine::TIME, (step + 0.5) / kSyncSteps);
     }
     else
     {

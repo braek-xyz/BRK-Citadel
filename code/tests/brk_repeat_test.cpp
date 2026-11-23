@@ -10,6 +10,7 @@
 #include "RefWrap.hpp"
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <vector>
@@ -238,7 +239,59 @@ int main()
         check(c.SyncBeats() == 0.5, "SYNC 2 bars at 60 bpm halves to 1/8 note");
     }
 
-    // 5. fuzz: random controls, loud input; must stay in range (sanitizers watch the memory)
+    // 5. Citadel clock: every pulse is a beat; TIME steps are fractions / multiples of the pulse.  A 1/16 clock at
+    //    110 bpm (one pulse every 6000 samples): the middle of TIME repeats every pulse, and cycles land on pulses.
+    {
+        static const double pulses[11] = {1.0 / 8, 1.0 / 4, 1.0 / 3, 1.0 / 2, 2.0 / 3, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0};
+        struct Case { int step; long expect; };
+        const Case cases[] = {{5, 6000}, {3, 3000}, {7, 12000}, {1, 1500}, {10, 24000}};
+        for (const Case &cs : cases)
+        {
+            static Core48 c;
+            c.Init(gL, gR, SR);
+            c.SetSyncTable(pulses, 11);
+            c.SetTempoRange(15, 30000);
+            c.SetParam(SYNC, 1);
+            c.SetParam(MIX, 1);
+            c.SetParam(TIME, (cs.step + 0.5) / 11);
+            const double period = 6000; // samples per pulse (a multiple of 48, as the Citadel measures it)
+            int32_t z[48] = {}, o[48], o2[48];
+            long since = 0, beats = 0, last = -1, len = 0, offBeat = 0, cyc = 0;
+            for (long b = 0; b < 8000; b++)
+            {
+                if (since >= period)
+                {
+                    since = 0;
+                    beats++;
+                }
+                const double frac = std::min(1.0, since / period);
+                c.SetTransport(60.0 * SR / period, (beats + frac) * period / SR);
+                c.ProcessBlock(z, z, o, o2);
+                since += 48;
+                if (c.TakeCycleFlag())
+                {
+                    const long at = b * 48;
+                    if (last >= 0)
+                        len = at - last;
+                    last = at;
+                    if (b > 2000)
+                    {
+                        cyc++;
+                        // the cycle starts within one block of a multiple of the cycle length on the pulse grid
+                        const long ph = at % cs.expect;
+                        if (std::min(ph, cs.expect - ph) > 200)
+                            offBeat++;
+                    }
+                }
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "1/16 clock, TIME step %d: cycle %ld samples (expect %ld), %ld of %ld cycle starts off the grid",
+                          cs.step, len, cs.expect, offBeat, cyc);
+            check(std::labs(len - cs.expect) <= 48 && cyc > 3 && offBeat == 0, buf);
+        }
+    }
+
+    // 6. fuzz: random controls, loud input; must stay in range (sanitizers watch the memory)
     {
         static Core48 c;
         c.Init(gL, gR, SR);

@@ -21,6 +21,8 @@
  *      The two 1e6-steep LAZERS switches (read from the previous cycle; second half of a cycle) are plain compares.
  *   4. DAMAGE bit reduction rounds halves away from zero (LAZERS: to even).
  *   5. The LAZERS idle self-heal is not part of it (as on the ER-301).
+ *   6. The SYNC length table and the accepted tempo range can be changed (SetSyncTable, SetTempoRange): the
+ *      Citadel counts every clock pulse as a beat, so a 1/16 clock at 150 bpm is 600 "beats" a minute.
  *
  * Real-time rules: ProcessBlock() never allocates, locks or touches flash or files.
  */
@@ -184,6 +186,22 @@ public:
             prm_[id] = v;
     }
     double GetParam(int id) const { return prm_[id]; }
+    /// Tempos accepted from SetTransport (others count as no tempo: 120 is used).  LAZERS / ER-301: 20..400.
+    void SetTempoRange(double lo, double hi)
+    {
+        bpmLo_ = lo;
+        bpmHi_ = hi;
+    }
+    /// SYNC lengths in beats that TIME chooses from (in equal steps); default: the LAZERS table kSyncT (10 notes).
+    /// The table must stay valid while the engine runs.
+    void SetSyncTable(const double *beats, int count)
+    {
+        if (beats && count > 0)
+        {
+            syncT_ = beats;
+            syncN_ = count;
+        }
+    }
     /// bpm 0 = no tempo (120 is used); timeSec = song position, SYNC locks to it while it keeps moving
     void SetTransport(double bpm, double time_sec)
     {
@@ -227,10 +245,10 @@ public:
         kSince = (kMov == 1 ? 0 : kSince + ksmps / sr);
         kMovT = (kMov == 1 ? 0.25 : kMovT - ksmps / sr);
         kTsX = kTs + kSince;
-        double kBpmU = (kBpm > 20 && kBpm < 400 ? kBpm : 120);
+        double kBpmU = (kBpm > bpmLo_ && kBpm < bpmHi_ ? kBpm : 120);
 
-        double kIx = clampLo(truncTo0(kTime * 9.999), 0, 9);
-        double kBeats = kSyncT[(int)kIx];
+        double kIx = clampLo(truncTo0(kTime * (syncN_ - 0.001)), 0, syncN_ - 1);
+        double kBeats = syncT_[(int)kIx];
         if (kSyn >= 0.5)
         {
             // port: halve a note that is too long for the memory (stays on the beat)
@@ -792,6 +810,9 @@ private:
            kLiveN = 0, kTb = 0, kHp = 0, kE = 0, kR1 = 0, kR2 = 0, kR3 = 0, kR4 = 0, kXs = 0, kWadv = 0;
     ChangeDetect tsChanged_, fzChanged_;
     double mixC_ = 0, mixY_ = 0;
+    double bpmLo_ = 20, bpmHi_ = 400;
+    const double *syncT_ = kSyncT;
+    int syncN_ = 10;
     double timeCached_ = -1, freePer_ = 0.0125, corCached_ = -1, beatsUsed_ = 1;
     int32_t dsNext_ = 0, dsCount_ = 0, dsStep_ = 65536, dsHeldL_ = 0, dsHeldR_ = 0, qStep8_ = 0;
     bool cycleFlag_ = false, sliceFlag_ = false;

@@ -28,10 +28,13 @@ may be added later (BRAEK's own code; which ones still to ask; dsp-research for 
 
 **BRK Repeat 0.4** (this session): the engine is now a port of the ER-301 engine (BRK-ER301 `dsp/RepeatEngine.cpp`
 = LAZERS REPEAT): block logic in double, line for line; per-sample read / record / crossfades / DAMAGE / mix in fixed
-point. Engine runs one 48-sample block per audio loop. TIME: the ten LAZERS notes (synced) or 12.5 ms..0.56 s (free).
-SHIFT + SAMPLE = CLOCK: FREE | 1 | 2 | 4 | 24 pulses per beat (default 1). HOLD / FREEZE as on the ER-301.
+point. Engine runs one 48-sample block per audio loop. HOLD / FREEZE as on the ER-301.
+BRAEK (2026-11-23): "Clock should always respond to what's coming in. 1/16 should make repeats 1/16, and I should be
+able to lower or make the repeats higher." So every clock pulse is a beat for the engine (no divide setting):
+synced TIME = 1/8, 1/4, 1/3, 1/2, 2/3, **1** (middle), 3/2, 2, 3, 4, 8 pulses (engine SetSyncTable / SetTempoRange).
+SHIFT + SAMPLE = SYNC (left half, default) / FREE (right half; 12.5 ms..0.56 s).
 - Host test: `code/tests/brk_repeat_test.cpp` runs it next to the ER-301 engine (copied in `code/tests/er301_reference`):
-  20 checks, 0 failed; outputs within about -56 to -86 dB of the ER-301 engine (DAMAGE at settings with fractional
+  25 checks, 0 failed (incl. a 1/16-clock test: cycles of 1/8..8 pulses land on the pulse grid); outputs within about -56 to -86 dB of the ER-301 engine (DAMAGE at settings with fractional
   hold counts differs by single-sample hold timing, -25 dB, compared loosely).
 - Build: flash 291 KB, static RAM 228 KB (93 %; 0.3 ran with 219 KB). `rdMap` runs from RAM (`.time_critical`),
   the block function from flash (compiled -Os; -O3 made it 18 KB).

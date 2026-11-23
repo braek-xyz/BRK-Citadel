@@ -45,7 +45,7 @@ private:
         WONK,     // POT_2 (SAMPLE MOD)
         DAMAGE,   // SHIFT + POT_2
         MIX,      // SHIFT + POT_4
-        CLOCK,    // SHIFT + POT_6: FREE | 1 | 2 | 4 | 24 clock pulses per beat
+        SYNC,     // SHIFT + POT_6: left half = synced to the clock, right half = free time
         COUNT
     };
 
@@ -56,9 +56,11 @@ private:
     static constexpr Hardware::AnalogInput CV_BRAEK = Hardware::AnalogInput::PARAM_1;    // SAMPLE CV
     static constexpr Hardware::AnalogInput CV_WONK = Hardware::AnalogInput::MODE;        // BANK CV
 
-    /// SHIFT + SAMPLE zones: 0 = FREE time, then clock pulses per beat
-    static constexpr int32_t kClockZones = 5;
-    static constexpr int32_t kPulsesPerBeat[kClockZones] = {0, 1, 2, 4, 24};
+    /// Synced TIME, in clock pulses: the middle of the knob is one pulse (the clock's own rate), left is faster,
+    /// right is slower.  Too long for the memory = halved until it fits.
+    static constexpr int kSyncSteps = 11;
+    static constexpr double kSyncPulses[kSyncSteps] = {1.0 / 8, 1.0 / 4, 1.0 / 3, 1.0 / 2, 2.0 / 3, 1.0,
+                                                       3.0 / 2, 2.0, 3.0, 4.0, 8.0};
 
     using Engine = brk::RepeatEngine;
     static constexpr int KS = 48;
@@ -79,9 +81,7 @@ private:
     bool mode_used_with_shift_ = false;
     bool hold_engaged_ = false;
 
-    // clock -> tempo and song position (as the ER-301 unit does it, in whole audio blocks)
-    int32_t pulses_per_beat_ = 1;
-    uint32_t pulse_count_ = 0;
+    // clock -> tempo and song position (as the ER-301 unit does it, in whole audio blocks); one pulse = one "beat"
     bool have_beat_ = false;
     double beats_ = 0;
     double samples_since_beat_ = 0;
