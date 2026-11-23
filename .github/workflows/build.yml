@@ -1,0 +1,46 @@
+# Builds the BRK-Citadel firmwares (.uf2) in the cloud.
+# Download them from the run page: Actions > "Build firmware" > the run > Artifacts.
+name: Build firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      GCC_VERSION: 14.2.1-1.1      # xPack Arm GCC (Bastl needs 14.2.1 or newer)
+      PICO_SDK_VERSION: 2.1.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Arm GCC
+        run: |
+          curl -sSL -o gcc.tgz "https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v${GCC_VERSION}/xpack-arm-none-eabi-gcc-${GCC_VERSION}-linux-x64.tar.gz"
+          mkdir -p "$HOME/tc" && tar xzf gcc.tgz -C "$HOME/tc"
+          echo "$HOME/tc/xpack-arm-none-eabi-gcc-${GCC_VERSION}/bin" >> "$GITHUB_PATH"
+          echo "PICO_TOOLCHAIN_PATH=$HOME/tc/xpack-arm-none-eabi-gcc-${GCC_VERSION}/bin" >> "$GITHUB_ENV"
+
+      - name: Get Pico SDK
+        run: |
+          git clone -q --depth 1 --branch "${PICO_SDK_VERSION}" https://github.com/raspberrypi/pico-sdk "$HOME/pico-sdk"
+          git -C "$HOME/pico-sdk" submodule update --init --depth 1 lib/tinyusb
+          echo "PICO_SDK_PATH=$HOME/pico-sdk" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          arm-none-eabi-gcc --version | head -1
+          cmake -S code -B code/build -DCMAKE_BUILD_TYPE=Debug
+          # Bastl's own firmwares (stock, unchanged) prove the build chain.
+          # wave-bard-with-samples is never built: Bastl's samples are "all rights reserved".
+          cmake --build code/build -j 4 --target fx-wizard template
+          ls -la code/build/output/*.uf2
+
+      - name: Upload firmware files
+        uses: actions/upload-artifact@v4
+        with:
+          name: brk-citadel-firmware
+          path: code/build/output/*.uf2
+          if-no-files-found: error
