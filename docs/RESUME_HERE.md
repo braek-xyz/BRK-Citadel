@@ -18,6 +18,9 @@ HOLD switching on by itself. Cause found: TRIG in is normalled to an internal ga
 TRIG -> HOLD and RESET -> FREEZE. Hardware test 2 (0.2): silence was the Citadel's stored INPUT level (SHIFT + PITCH MOD), left low from Wave Bard use.
 After raising it, levels OK. Manual should tell users to check SHIFT + PITCH MOD / SHIFT + PITCH first.
 
+Hardware test 3 (0.2): knobs did nothing; HOLD worked at a fixed length. Cause: FancyPot values update only in
+ReadValue(), which must be called from UiLoop() (as FX Wizard does). Fixed in 0.3.
+
 Next:
 1. BRAEK flashes `kastle2-brk-repeat.uf2` and reports: does it pass audio, do REPEATS / TIME / HOLD / FREEZE work,
    any clicks, LED colours, clock sync.

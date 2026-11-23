@@ -210,6 +210,12 @@ FASTCODE void AppBrkRepeat::AudioLoop(q15_t *input, q15_t *output, size_t size)
 
 void AppBrkRepeat::UiLoop()
 {
+    // Read the knobs (Bastl's FancyPot only updates its value here; first hardware test found the knobs dead without it)
+    for (auto &pot : pots_)
+    {
+        pot->ReadValue();
+    }
+
     if (Kastle2::hw.GetLayer() == Hardware::Layer::NORMAL || Kastle2::hw.GetLayer() == Hardware::Layer::MODE)
     {
         uint32_t color;

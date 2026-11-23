@@ -4,7 +4,7 @@ A beat repeater / micro sound repeater. It keeps a short memory of the incoming 
 over and over, in time with your clock. Add random gaps and jumps (BRAEK), random speed and direction (WONK) and
 crunch (DAMAGE), or freeze a loop. Same idea as the REPEAT effect in LAZERS.
 
-**Version 0.2, test build.** 0.1 was tried once on hardware (no sound; HOLD switched on by itself).
+**Version 0.3, test build.** Fixes from hardware tests: TRIG no longer switches HOLD (0.2), knobs are read (0.3).
 
 ## Install
 1. Download `brk-citadel-firmware` from the latest green run of "Build firmware" on GitHub (Actions tab), unzip it.
